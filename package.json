@@ -1,0 +1,36 @@
+{
+  "name": "vvs-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Vision Valley School Management System - API",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "migrate": "node scripts/migrate.js",
+    "migrate:status": "node scripts/migrate.js --status",
+    "seed": "node scripts/seed.js",
+    "db:reset": "node scripts/db-reset.js",
+    "db:setup": "npm run migrate && npm run seed",
+    "handover": "node scripts/handover-credentials.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
+    "test:watch": "node --test --watch --test-concurrency=1 tests/*.test.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cookie-parser": "^1.4.6",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^2.5.0",
+    "pg": "^8.12.0",
+    "zod": "^3.23.8"
+  }
+}
