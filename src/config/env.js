@@ -40,6 +40,11 @@ export const config = {
   db: {
     url: required('DATABASE_URL'),
     poolMax: int('DB_POOL_MAX', 10),
+    /**
+     * A hung query must fail as a 500 we can log, not as a platform 504. Vercel kills the
+     * function after 300s; both timeouts below are well under that.
+     */
+    queryTimeoutMs: int('DB_QUERY_TIMEOUT_MS', 10_000),
   },
   auth: {
     accessSecret: required('JWT_ACCESS_SECRET'),
