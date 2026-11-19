@@ -8,6 +8,15 @@ import { healthCheck } from './config/db.js';
 import { AppError } from './utils/errors.js';
 import apiRoutes from './routes/index.js';
 
+/**
+ * Every host this deployment can legitimately be opened from: any `vvs-*.vercel.app`
+ * (production alias, short alias, per-deployment preview) and localhost/127.0.0.1 on any port.
+ * Kept narrow on purpose — a bare `*.vercel.app` would let anyone's Vercel site call the API
+ * with the visitor's cookies.
+ */
+const PROJECT_ORIGIN = /^https:\/\/vvs-[a-z0-9-]+\.vercel\.app$/;
+const LOCAL_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+
 export function createApp() {
   const app = express();
 
@@ -17,18 +26,22 @@ export function createApp() {
   app.use(
     cors({
       /**
-       * A project can be reached through more than one vercel.app alias (the short
-       * `<project>-<suffix>` form and the `<project>-<team>` form). CLIENT_ORIGIN therefore
-       * accepts a comma-separated list; an origin that is not on it gets no CORS headers,
-       * which the browser blocks. Same-origin/no-Origin requests (server-to-server, curl)
-       * are always allowed.
+       * A Vercel project answers on many hosts: the short `<project>-<suffix>.vercel.app`, the
+       * `<project>-<team>.vercel.app` form, and a fresh `<project>-<hash>-<team>.vercel.app` for
+       * every deployment/preview. An origin missing from the list gets no CORS headers, which the
+       * browser reports as a network error — the login screen then says only "Could not sign in".
+       * So: the explicit CLIENT_ORIGIN list, plus any host of this project's own family, plus
+       * localhost on any port for development. Everything else is refused and logged.
        */
       origin(origin, callback) {
         const allowed = config.clientOrigin
           .split(',')
           .map((value) => value.trim())
           .filter(Boolean);
-        if (!origin || allowed.includes(origin)) return callback(null, true);
+        if (!origin) return callback(null, true);
+        if (allowed.includes(origin)) return callback(null, true);
+        if (PROJECT_ORIGIN.test(origin) || LOCAL_ORIGIN.test(origin)) return callback(null, true);
+        console.warn('[api] blocked CORS origin:', origin);
         return callback(null, false);
       },
       credentials: true,
