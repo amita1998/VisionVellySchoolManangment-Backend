@@ -15,7 +15,21 @@ export function createApp() {
   app.use(helmet());
   app.use(
     cors({
-      origin: config.clientOrigin,
+      /**
+       * A project can be reached through more than one vercel.app alias (the short
+       * `<project>-<suffix>` form and the `<project>-<team>` form). CLIENT_ORIGIN therefore
+       * accepts a comma-separated list; an origin that is not on it gets no CORS headers,
+       * which the browser blocks. Same-origin/no-Origin requests (server-to-server, curl)
+       * are always allowed.
+       */
+      origin(origin, callback) {
+        const allowed = config.clientOrigin
+          .split(',')
+          .map((value) => value.trim())
+          .filter(Boolean);
+        if (!origin || allowed.includes(origin)) return callback(null, true);
+        return callback(null, false);
+      },
       credentials: true,
     }),
   );
