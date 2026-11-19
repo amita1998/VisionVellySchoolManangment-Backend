@@ -20,3 +20,5 @@ coverage/
 # Uploaded files
 storage/
 
+.vercel
+.env*
