@@ -35,6 +35,8 @@ export const config = {
   isTest: nodeEnv === 'test',
   port: int('PORT', 4001),
   appName: process.env.APP_NAME || 'Vision Valley School Management System',
+  /** Name shown by the bare-host status probe. API_SERVICE_NAME overrides it. */
+  statusService: process.env.API_SERVICE_NAME || 'EERMS API',
   clientOrigin: process.env.CLIENT_ORIGIN || 'http://localhost:5174',
   timezone: process.env.TIMEZONE || 'Asia/Kolkata',
   db: {

@@ -52,6 +52,22 @@ export function createApp() {
     }
   });
 
+  /**
+   * Connectivity probe for the bare API host (`https://<backend>/` and `/api`).
+   * Opening the deployment URL in a browser should say the service is up instead of the
+   * generic 404 envelope — that 404 is what reads as "backend connect nahi hua".
+   * Deliberately not the app envelope: this shape is the one people paste into a status check.
+   */
+  app.get(['/', '/api'], async (_req, res) => {
+    try {
+      await healthCheck();
+      res.json({ ok: true, service: config.statusService, status: 'running' });
+    } catch (error) {
+      console.error('[api] status probe failed', error.code || error.message);
+      res.status(503).json({ ok: false, service: config.statusService, status: 'database unreachable' });
+    }
+  });
+
   app.use('/api', apiRoutes);
 
   app.use((req, res) => {
