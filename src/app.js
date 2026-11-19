@@ -5,6 +5,7 @@ import cookieParser from 'cookie-parser';
 import morgan from 'morgan';
 import { config } from './config/env.js';
 import { healthCheck } from './config/db.js';
+import { AppError } from './utils/errors.js';
 import apiRoutes from './routes/index.js';
 
 export function createApp() {
@@ -69,10 +70,16 @@ export function createApp() {
       success: false,
       error: {
         code: error.code || (status >= 500 ? 'INTERNAL_ERROR' : 'REQUEST_ERROR'),
+        /**
+         * 5xx messages are masked in production so an unexpected stack/DB error never leaks.
+         * An AppError is ours and written for the person reading it (e.g. UPLOADS_UNAVAILABLE,
+         * "storage is not configured on this deployment"), so its message is shown as-is;
+         * masking it produces "Something went wrong" for a problem the user can act on.
+         */
         message:
           status >= 500 && !config.isProduction
             ? error.message
-            : status >= 500
+            : status >= 500 && !(error instanceof AppError)
               ? 'Something went wrong. Please try again.'
               : error.message,
       },
