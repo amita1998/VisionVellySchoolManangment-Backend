@@ -61,12 +61,16 @@ export async function saveUpload({ file, folder }) {
       sizeBytes: file.size,
     };
   } catch (error) {
-    // Serverless platforms mount the bundle read-only: say so plainly instead of a 500.
-    if (error.code === 'EROFS' || error.code === 'EACCES' || error.code === 'EPERM') {
+    /**
+     * Serverless platforms mount the bundle read-only — and often without the parent directory
+     * at all, so `mkdir` fails with ENOENT rather than EROFS/EACCES. Say so plainly instead of
+     * leaking a 500 from a mid-transaction filesystem call.
+     */
+    if (['EROFS', 'EACCES', 'EPERM', 'ENOENT', 'ENOTDIR'].includes(error.code)) {
       throw new AppError(
         503,
         'UPLOADS_UNAVAILABLE',
-        'Document storage is not configured on this deployment. Ask the school office to upload this file from the desktop app, or configure object storage (UPLOAD_DIR is read-only).',
+        'Document storage is not configured on this deployment, so files cannot be attached here. Save the record without documents, or upload the file from the desktop install (UPLOAD_DIR is not writable).',
       );
     }
     throw error;

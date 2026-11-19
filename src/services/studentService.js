@@ -323,6 +323,9 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
 
       // 5. Documents (already validated for type and size by multer).
       for (let index = 0; index < files.length; index += 1) {
+        // An empty file part (a form field left untouched) is not a document: skip it instead of
+        // writing a 0-byte row — and instead of failing the whole admission on a storage error.
+        if (!files[index] || !files[index].size) continue;
         const stored = await saveUpload({ file: files[index], folder: `students/${studentId}` });
         writtenFiles.push(stored.filePath);
         await client.query(
@@ -738,6 +741,9 @@ export async function addDocuments(studentId, files, documentTypes, actor) {
     return await withTransaction(async (client) => {
       const inserted = [];
       for (let index = 0; index < files.length; index += 1) {
+        // An empty file part (a form field left untouched) is not a document: skip it instead of
+        // writing a 0-byte row — and instead of failing the whole admission on a storage error.
+        if (!files[index] || !files[index].size) continue;
         const stored = await saveUpload({ file: files[index], folder: `students/${studentId}` });
         written.push(stored.filePath);
         const { rows } = await client.query(
