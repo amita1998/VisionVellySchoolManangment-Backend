@@ -11,6 +11,8 @@ import commsRoutes from './comms.routes.js';
 import timetableRoutes from './timetable.routes.js';
 import adminRoutes from './admin.routes.js';
 import libraryRoutes from './library.routes.js';
+import leaveRoutes from './leave.routes.js';
+import idCardRoutes from './idCards.routes.js';
 
 const router = Router();
 
@@ -26,5 +28,7 @@ router.use('/comms', commsRoutes);
 router.use('/timetable', timetableRoutes);
 router.use('/admin', adminRoutes);
 router.use('/library', libraryRoutes);
+router.use('/leave', leaveRoutes);
+router.use('/id-cards', idCardRoutes);
 
 export default router;
