@@ -34,6 +34,12 @@ export const PERMISSIONS = {
   ATTENDANCE_CORRECTION_REQUEST: 'attendance.correction.request',
   ATTENDANCE_CORRECTION_REVIEW: 'attendance.correction.review',
 
+  // library
+  LIBRARY_VIEW: 'library.view',
+  LIBRARY_MANAGE: 'library.manage',
+  LIBRARY_VIEW_OWN: 'library.view.own',
+  LIBRARY_VIEW_CHILDREN: 'library.view.children',
+
   // examinations and results
   EXAM_VIEW: 'exam.view',
   EXAM_MANAGE: 'exam.manage',
@@ -81,6 +87,8 @@ export const ROLE_PERMISSIONS = {
     P.STUDENT_VIEW_ASSIGNED,
     P.TEACHER_VIEW_OWN,
     P.ACADEMIC_VIEW,
+    P.LIBRARY_VIEW,
+    P.LIBRARY_VIEW_OWN,
     P.ATTENDANCE_MARK,
     P.ATTENDANCE_VIEW_ASSIGNED,
     P.ATTENDANCE_CORRECTION_REQUEST,
@@ -98,6 +106,8 @@ export const ROLE_PERMISSIONS = {
   student: [
     P.STUDENT_VIEW_OWN,
     P.ACADEMIC_VIEW,
+    P.LIBRARY_VIEW,
+    P.LIBRARY_VIEW_OWN,
     P.ATTENDANCE_VIEW_OWN,
     P.EXAM_VIEW,
     P.RESULT_VIEW_OWN,
@@ -111,6 +121,8 @@ export const ROLE_PERMISSIONS = {
   parent: [
     P.STUDENT_VIEW_CHILDREN,
     P.ACADEMIC_VIEW,
+    P.LIBRARY_VIEW,
+    P.LIBRARY_VIEW_CHILDREN,
     P.ATTENDANCE_VIEW_CHILDREN,
     P.EXAM_VIEW,
     P.RESULT_VIEW_CHILDREN,
@@ -167,6 +179,10 @@ export const PERMISSION_LABELS = {
   [P.USER_MANAGE]: 'Manage user accounts',
   [P.SETTINGS_MANAGE]: 'Manage school settings',
   [P.AUDIT_VIEW]: 'View the audit log',
+  [P.LIBRARY_VIEW]: 'View the library catalogue',
+  [P.LIBRARY_MANAGE]: 'Manage books, issues and returns',
+  [P.LIBRARY_VIEW_OWN]: 'View own borrowed books',
+  [P.LIBRARY_VIEW_CHILDREN]: "View a child's borrowed books",
 };
 
 export function permissionsFor(role) {

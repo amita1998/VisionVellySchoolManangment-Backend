@@ -10,6 +10,7 @@ import feeRoutes from './fees.routes.js';
 import commsRoutes from './comms.routes.js';
 import timetableRoutes from './timetable.routes.js';
 import adminRoutes from './admin.routes.js';
+import libraryRoutes from './library.routes.js';
 
 const router = Router();
 
@@ -24,5 +25,6 @@ router.use('/fees', feeRoutes);
 router.use('/comms', commsRoutes);
 router.use('/timetable', timetableRoutes);
 router.use('/admin', adminRoutes);
+router.use('/library', libraryRoutes);
 
 export default router;
