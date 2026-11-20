@@ -253,13 +253,41 @@ export async function listAttendance(req) {
   const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 25));
   const offset = (page - 1) * limit;
 
+  /**
+   * Filters are shared by the list, the count and the summary query, so each one has to be
+   * expressible without extra joins: the class filter therefore goes through sections instead of
+   * referencing `classes`. Both class and section are honoured — the admin screen sends classId
+   * alone when no section is picked, and ignoring it (the old behaviour) made the class dropdown
+   * look broken because the register never changed.
+   *
+   * The class placeholder is numbered AFTER the scope parameters (scopeFilter already owns $4 for
+   * students/parents/teachers), never hard-coded.
+   */
+  const listParams = [
+    yearId,
+    req.query.date || null,
+    req.query.sectionId ? Number(req.query.sectionId) : null,
+    ...params,
+  ];
+  const classParam = listParams.length + 1;
+  listParams.push(req.query.classId ? Number(req.query.classId) : null);
+
   const filters = `
     a.academic_year_id = $1
     ${clause}
     AND ($2::date IS NULL OR a.attendance_date = $2::date)
     AND ($3::int IS NULL OR a.section_id = $3)
+    AND (
+      $${classParam}::int IS NULL
+      OR a.section_id IN (SELECT sec.id FROM sections sec WHERE sec.class_id = $${classParam})
+    )
   `;
-  const listParams = [yearId, req.query.date || null, req.query.sectionId ? Number(req.query.sectionId) : null, ...params];
+
+  // Class-wise view reads oldest-class-first so the register groups naturally; the plain
+  // date view keeps newest-day-first.
+  const orderBy = req.query.classId
+    ? 'ORDER BY c.level_order, s.name, st.admission_id, a.attendance_date DESC'
+    : 'ORDER BY a.attendance_date DESC, st.admission_id';
 
   const [rows, total, summary] = await Promise.all([
     query(
@@ -273,7 +301,7 @@ export async function listAttendance(req) {
          JOIN sections s ON s.id = a.section_id
          JOIN classes c ON c.id = s.class_id
         WHERE ${filters}
-        ORDER BY a.attendance_date DESC, st.admission_id
+        ${orderBy}
         LIMIT $${listParams.length + 1} OFFSET $${listParams.length + 2}`,
       [...listParams, limit, offset],
     ),

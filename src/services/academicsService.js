@@ -1,6 +1,13 @@
 import { config } from '../config/env.js';
 import { query, withTransaction } from '../config/db.js';
-import { conflict, notFound } from '../utils/errors.js';
+import { AppError, conflict, notFound } from '../utils/errors.js';
+
+/**
+ * `badRequest()` in utils/errors.js takes *fields* as its second argument, not a code.
+ * Stream rules need their own machine-readable codes so the UI can point at the right control,
+ * so they raise AppError directly.
+ */
+const badRequestWithCode = (message, code) => new AppError(400, code, message);
 
 /** Current academic year (one row max, enforced by a partial unique index). */
 export async function currentYear(client = null) {
@@ -60,10 +67,59 @@ export async function setCurrentYear(yearId, actorId) {
 // Classes and sections
 // ---------------------------------------------------------------------------
 
+/**
+ * Streams exist for the senior classes only (Class 11 and 12, `level_order >= 13`).
+ * Everything else keeps `stream_id IS NULL`, which is why no existing row had to change.
+ */
+const SENIOR_LEVEL = 13;
+
+export function classNeedsStream(levelOrder) {
+  return Number(levelOrder) >= SENIOR_LEVEL;
+}
+
+export async function listStreams() {
+  const { rows } = await query(
+    `SELECT id, code, name FROM streams WHERE deleted_at IS NULL AND is_active ORDER BY name`,
+  );
+  return rows;
+}
+
+async function assertStreamForClass(client, classId, streamId) {
+  const { rows } = await client.query(
+    'SELECT id, name, level_order, strength_limit FROM classes WHERE id = $1 AND deleted_at IS NULL',
+    [classId],
+  );
+  const klass = rows[0];
+  if (!klass) throw notFound('Class not found.');
+  const senior = classNeedsStream(klass.level_order);
+
+  if (!senior && streamId) {
+    throw badRequestWithCode(
+      `${klass.name} does not use streams — only Class 11 and Class 12 do.`,
+      'STREAM_NOT_APPLICABLE',
+    );
+  }
+  if (senior && !streamId) {
+    throw badRequestWithCode(
+      `${klass.name} needs a stream (Science / Commerce / Arts).`,
+      'STREAM_REQUIRED',
+    );
+  }
+  if (streamId) {
+    const stream = await client.query(
+      'SELECT id FROM streams WHERE id = $1 AND deleted_at IS NULL AND is_active',
+      [streamId],
+    );
+    if (!stream.rows[0]) throw badRequestWithCode('Unknown stream.', 'STREAM_NOT_FOUND');
+  }
+  return klass;
+}
+
 export async function listClasses() {
   const year = await currentYear();
   const { rows } = await query(
     `SELECT c.id, c.name, c.level_order, c.is_pre_primary, c.strength_limit,
+            (c.level_order >= ${SENIOR_LEVEL}) AS needs_stream,
             (SELECT count(*)::int FROM class_subjects cs
                JOIN subjects sub ON sub.id = cs.subject_id AND sub.deleted_at IS NULL
               WHERE cs.class_id = c.id) AS subject_count,
@@ -72,6 +128,8 @@ export async function listClasses() {
             COALESCE((
               SELECT json_agg(json_build_object(
                        'id', s.id, 'name', s.name, 'capacity', s.capacity,
+                       'stream_id', s.stream_id,
+                       'stream', (SELECT st.name FROM streams st WHERE st.id = s.stream_id),
                        'students', (SELECT count(*)::int FROM enrollments e2
                                      WHERE e2.section_id = s.id AND e2.academic_year_id = $1
                                        AND e2.status = 'active'),
@@ -79,9 +137,22 @@ export async function listClasses() {
                                            FROM class_teachers ct JOIN teachers t ON t.id = ct.teacher_id
                                           WHERE ct.section_id = s.id AND ct.academic_year_id = $1
                                           LIMIT 1))
-                     ORDER BY s.name)
+                     ORDER BY (SELECT st.name FROM streams st WHERE st.id = s.stream_id) NULLS FIRST,
+                              s.name)
                 FROM sections s WHERE s.class_id = c.id AND s.deleted_at IS NULL
-            ), '[]'::json) AS sections
+            ), '[]'::json) AS sections,
+            COALESCE((
+              SELECT json_agg(json_build_object(
+                       'stream_id', cs.stream_id,
+                       'stream', (SELECT st.name FROM streams st WHERE st.id = cs.stream_id),
+                       'subjects', cs.total)
+                     ORDER BY (SELECT st.name FROM streams st WHERE st.id = cs.stream_id) NULLS FIRST)
+                FROM (SELECT cs.stream_id, count(*)::int AS total
+                        FROM class_subjects cs
+                        JOIN subjects sub ON sub.id = cs.subject_id AND sub.deleted_at IS NULL
+                       WHERE cs.class_id = c.id
+                       GROUP BY cs.stream_id) cs
+            ), '[]'::json) AS subjects_by_stream
        FROM classes c
       WHERE c.deleted_at IS NULL
       ORDER BY c.level_order`,
@@ -137,38 +208,53 @@ export async function deleteClass(classId) {
   return { deleted: true };
 }
 
-export async function createSection(classId, { name, capacity }) {
-  const klass = await query('SELECT id, strength_limit FROM classes WHERE id = $1 AND deleted_at IS NULL', [
-    classId,
-  ]);
-  if (!klass.rows[0]) throw notFound('Class not found.');
-  try {
-    const { rows } = await query(
-      'INSERT INTO sections (class_id, name, capacity) VALUES ($1, $2, $3) RETURNING id, name, capacity',
-      [classId, name, capacity ?? klass.rows[0].strength_limit ?? 40],
-    );
-    return rows[0];
-  } catch (error) {
-    if (error.code === '23505') {
-      throw conflict('That section already exists for this class.', 'SECTION_EXISTS');
+export async function createSection(classId, { name, capacity, streamId = null }) {
+  return withTransaction(async (client) => {
+    const klass = await assertStreamForClass(client, classId, streamId);
+    try {
+      const { rows } = await client.query(
+        `INSERT INTO sections (class_id, name, capacity, stream_id) VALUES ($1, $2, $3, $4)
+         RETURNING id, name, capacity, stream_id`,
+        [classId, name, capacity ?? klass.strength_limit ?? 40, streamId],
+      );
+      return rows[0];
+    } catch (error) {
+      if (error.code === '23505') {
+        throw conflict('That section already exists for this class.', 'SECTION_EXISTS');
+      }
+      throw error;
     }
-    throw error;
-  }
+  });
 }
 
-export async function updateSection(sectionId, { name, capacity }) {
-  try {
-    const { rows } = await query(
-      `UPDATE sections SET name = $2, capacity = $3 WHERE id = $1 AND deleted_at IS NULL
-       RETURNING id, name, capacity`,
-      [sectionId, name, capacity],
+/**
+ * `streamId` is optional: omitted keeps the current stream (so a capacity-only edit on Class 11
+ * does not silently drop the stream), an explicit value moves the section.
+ */
+export async function updateSection(sectionId, { name, capacity, streamId }) {
+  return withTransaction(async (client) => {
+    const current = await client.query(
+      'SELECT class_id, stream_id FROM sections WHERE id = $1 AND deleted_at IS NULL',
+      [sectionId],
     );
-    if (!rows[0]) throw notFound('Section not found.');
-    return rows[0];
-  } catch (error) {
-    if (error.code === '23505') throw conflict('That section name is already used.', 'SECTION_EXISTS');
-    throw error;
-  }
+    if (!current.rows[0]) throw notFound('Section not found.');
+    const nextStream = streamId === undefined ? current.rows[0].stream_id : streamId ?? null;
+    await assertStreamForClass(client, current.rows[0].class_id, nextStream);
+
+    try {
+      const { rows } = await client.query(
+        `UPDATE sections SET name = $2, capacity = $3, stream_id = $4
+          WHERE id = $1 AND deleted_at IS NULL
+          RETURNING id, name, capacity, stream_id`,
+        [sectionId, name, capacity, nextStream],
+      );
+      if (!rows[0]) throw notFound('Section not found.');
+      return rows[0];
+    } catch (error) {
+      if (error.code === '23505') throw conflict('That section name is already used.', 'SECTION_EXISTS');
+      throw error;
+    }
+  });
 }
 
 export async function deleteSection(sectionId) {
@@ -245,32 +331,46 @@ export async function deleteSubject(subjectId) {
   return { deleted: true };
 }
 
-export async function classSubjects(classId) {
+/**
+ * Subjects assigned to a class. For Class 11/12 the assignment is per stream, so the caller passes
+ * the stream; `IS NOT DISTINCT FROM` matches NULL for every other class instead of returning nothing.
+ */
+export async function classSubjects(classId, streamId = null) {
   const { rows } = await query(
-    `SELECT s.id, s.name, s.code
+    `SELECT s.id, s.name, s.code, cs.stream_id
        FROM class_subjects cs JOIN subjects s ON s.id = cs.subject_id AND s.deleted_at IS NULL
-      WHERE cs.class_id = $1 ORDER BY s.name`,
-    [classId],
+      WHERE cs.class_id = $1 AND cs.stream_id IS NOT DISTINCT FROM $2::int
+      ORDER BY s.name`,
+    [classId, streamId ?? null],
   );
   return rows;
 }
 
-export async function setClassSubjects(classId, subjectIds) {
+/**
+ * Replaces the subject list of ONE class, or of one class+stream for Class 11/12.
+ * The delete is scoped the same way, so editing Class 11 - Science never wipes Commerce.
+ */
+export async function setClassSubjects(classId, subjectIds, streamId = null) {
   return withTransaction(async (client) => {
-    const klass = await client.query('SELECT id FROM classes WHERE id = $1 AND deleted_at IS NULL', [classId]);
-    if (!klass.rows[0]) throw notFound('Class not found.');
+    await assertStreamForClass(client, classId, streamId);
 
-    await client.query('DELETE FROM class_subjects WHERE class_id = $1', [classId]);
+    await client.query(
+      'DELETE FROM class_subjects WHERE class_id = $1 AND stream_id IS NOT DISTINCT FROM $2::int',
+      [classId, streamId ?? null],
+    );
     for (const subjectId of [...new Set(subjectIds)]) {
       await client.query(
-        'INSERT INTO class_subjects (class_id, subject_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-        [classId, subjectId],
+        `INSERT INTO class_subjects (class_id, subject_id, stream_id) VALUES ($1, $2, $3)
+         ON CONFLICT DO NOTHING`,
+        [classId, subjectId, streamId ?? null],
       );
     }
     const { rows } = await client.query(
-      `SELECT s.id, s.name, s.code FROM class_subjects cs
-         JOIN subjects s ON s.id = cs.subject_id WHERE cs.class_id = $1 ORDER BY s.name`,
-      [classId],
+      `SELECT s.id, s.name, s.code, cs.stream_id FROM class_subjects cs
+         JOIN subjects s ON s.id = cs.subject_id
+        WHERE cs.class_id = $1 AND cs.stream_id IS NOT DISTINCT FROM $2::int
+        ORDER BY s.name`,
+      [classId, streamId ?? null],
     );
     return rows;
   });
@@ -282,10 +382,11 @@ export async function setClassSubjects(classId, subjectIds) {
 
 export async function options() {
   const year = await currentYear();
-  const [classes, subjects, years, teachers] = await Promise.all([
+  const [classes, subjects, years, streams, teachers] = await Promise.all([
     listClasses(),
     listSubjects(),
     listAcademicYears(),
+    listStreams(),
     query(
       `SELECT id, employee_id, trim(concat(first_name, ' ', last_name)) AS name, status
          FROM teachers WHERE deleted_at IS NULL AND status = 'active' ORDER BY first_name`,
@@ -297,9 +398,13 @@ export async function options() {
     classes: classes.map((row) => ({
       id: row.id,
       name: row.name,
+      levelOrder: row.level_order,
+      needsStream: row.needs_stream,
       sections: row.sections,
+      subjectsByStream: row.subjects_by_stream,
       studentCount: row.student_count,
     })),
+    streams,
     subjects,
     teachers: teachers.rows,
   };

@@ -137,9 +137,11 @@ export const classSchema = z.object({
   strengthLimit: z.coerce.number().int().min(1).max(200).optional(),
 });
 
+/** A section carries a stream only for Class 11/12; the service rejects a stream elsewhere. */
 export const sectionSchema = z.object({
   name: z.string().trim().min(1, 'Required').max(10),
   capacity: z.coerce.number().int().min(1).max(200).optional(),
+  streamId: z.union([ID, z.literal(''), z.null()]).optional(),
 });
 
 export const subjectSchema = z.object({
@@ -153,8 +155,10 @@ export const subjectSchema = z.object({
   isPrePrimary: z.boolean().optional(),
 });
 
+/** Stream is required by the service for Class 11/12 and refused for every other class. */
 export const classSubjectsSchema = z.object({
   subjectIds: z.array(ID).max(40),
+  streamId: z.union([ID, z.literal(''), z.null()]).optional(),
 });
 
 export const academicYearSchema = z

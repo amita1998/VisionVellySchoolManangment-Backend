@@ -37,8 +37,16 @@ export const deleteClass = asyncHandler(async (req, res) => {
 });
 
 // sections
+/** '' and null both mean "no stream"; a number means that stream. */
+function normaliseStreamId(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  return Number(value);
+}
+
 export const createSection = asyncHandler(async (req, res) => {
-  const payload = parseBody(sectionSchema, req.body);
+  const body = parseBody(sectionSchema, req.body);
+  const payload = { ...body, streamId: normaliseStreamId(body.streamId) ?? null };
   res.status(201).json({
     success: true,
     data: await academics.createSection(Number(req.params.classId), payload),
@@ -46,7 +54,8 @@ export const createSection = asyncHandler(async (req, res) => {
 });
 
 export const updateSection = asyncHandler(async (req, res) => {
-  const payload = parseBody(sectionSchema, req.body);
+  const body = parseBody(sectionSchema, req.body);
+  const payload = { ...body, streamId: normaliseStreamId(body.streamId) };
   res.json({ success: true, data: await academics.updateSection(Number(req.params.id), payload) });
 });
 
@@ -74,14 +83,25 @@ export const deleteSubject = asyncHandler(async (req, res) => {
 });
 
 export const classSubjects = asyncHandler(async (req, res) => {
-  res.json({ success: true, data: { subjects: await academics.classSubjects(Number(req.params.id)) } });
+  const streamId = normaliseStreamId(req.query.streamId) ?? null;
+  res.json({
+    success: true,
+    data: {
+      streamId,
+      subjects: await academics.classSubjects(Number(req.params.id), streamId),
+    },
+  });
 });
 
 export const setClassSubjects = asyncHandler(async (req, res) => {
   const payload = parseBody(classSubjectsSchema, req.body);
+  const streamId = normaliseStreamId(payload.streamId) ?? null;
   res.json({
     success: true,
-    data: { subjects: await academics.setClassSubjects(Number(req.params.id), payload.subjectIds) },
+    data: {
+      streamId,
+      subjects: await academics.setClassSubjects(Number(req.params.id), payload.subjectIds, streamId),
+    },
   });
 });
 
