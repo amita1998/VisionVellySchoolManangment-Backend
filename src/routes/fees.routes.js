@@ -24,6 +24,7 @@ router.get('/categories', canView, fees.categories);
 router.post('/categories', manage, fees.createCategory);
 router.get('/structures', canView, fees.structures);
 router.post('/structures', manage, fees.createStructure);
+router.post('/structures/bulk', manage, fees.bulkStructures);
 router.delete('/structures/:id', manage, fees.deleteStructure);
 router.post('/assign', manage, fees.assign);
 router.get('/overview', manage, fees.overview);

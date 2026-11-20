@@ -115,10 +115,44 @@ export async function listStructures() {
   return rows;
 }
 
+/** How many installments a plan produces, and how far apart they fall. */
+const PLAN_STEPS = {
+  monthly: { count: 12, months: 1 },
+  quarterly: { count: 4, months: 3 },
+  half_yearly: { count: 2, months: 6 },
+  term: { count: 3, months: 4 },
+  one_time: { count: 1, months: 0 },
+};
+
+/** Writes the installment rows for a structure; split is equal except the last row, which carries the remainder. */
+async function writeInstallments(client, structureId, totalAmount, plan, yearStart) {
+  const { count, months } = PLAN_STEPS[plan];
+  const per = Math.round((Number(totalAmount) / count) * 100) / 100;
+  const start = new Date(`${yearStart}T00:00:00Z`);
+  for (let index = 0; index < count; index += 1) {
+    const due = new Date(start);
+    if (months) due.setUTCMonth(due.getUTCMonth() + index * months);
+    await client.query(
+      `INSERT INTO fee_installments (fee_structure_id, seq, label, due_date, amount)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        structureId,
+        index + 1,
+        plan === 'one_time' ? 'Full payment' : `${index + 1}/${count}`,
+        due.toISOString().slice(0, 10),
+        index === count - 1
+          ? Math.round((Number(totalAmount) - per * (count - 1)) * 100) / 100
+          : per,
+      ],
+    );
+  }
+  return count;
+}
+
 export async function createStructure(payload, actor, ip, userAgent) {
   const year = await currentYear();
   if (!year) throw conflict('No current academic year is configured.', 'NO_ACADEMIC_YEAR');
-  const planCount = { monthly: 12, quarterly: 4, term: 3, one_time: 1 }[payload.installmentPlan];
+  const planCount = { monthly: 12, quarterly: 4, half_yearly: 2, term: 3, one_time: 1 }[payload.installmentPlan];
   if (!planCount) throw conflict('Unknown installment plan.', 'BAD_PLAN');
 
   try {
@@ -134,6 +168,7 @@ export async function createStructure(payload, actor, ip, userAgent) {
         const due = new Date(start);
         if (payload.installmentPlan === 'monthly') due.setUTCMonth(due.getUTCMonth() + index);
         else if (payload.installmentPlan === 'quarterly') due.setUTCMonth(due.getUTCMonth() + index * 3);
+        else if (payload.installmentPlan === 'half_yearly') due.setUTCMonth(due.getUTCMonth() + index * 6);
         else if (payload.installmentPlan === 'term') due.setUTCMonth(due.getUTCMonth() + index * 4);
         await client.query(
           `INSERT INTO fee_installments (fee_structure_id, seq, label, due_date, amount)
@@ -168,6 +203,146 @@ export async function createStructure(payload, actor, ip, userAgent) {
     }
     throw error;
   }
+}
+
+/**
+ * Class-wise fee setup: one category + plan, one amount per class.
+ *
+ * Existing structures are updated in place — but only while nobody owes against them. Once a
+ * `student_fees` row exists the amount is already part of a student's ledger, so rewriting it
+ * would change what a family was told; that case is refused instead of silently re-priced.
+ * An amount of 0 means "this class does not pay this category": nothing is created, and an
+ * unused structure is removed.
+ */
+export async function bulkStructures(payload, actor, ip, userAgent) {
+  const year = await currentYear();
+  if (!year) throw conflict('No current academic year is configured.', 'NO_ACADEMIC_YEAR');
+  if (!PLAN_STEPS[payload.installmentPlan]) throw conflict('Unknown installment plan.', 'BAD_PLAN');
+
+  return withTransaction(async (client) => {
+    const results = [];
+    for (const entry of payload.entries) {
+      const klass = await client.query('SELECT id, name FROM classes WHERE id = $1 AND deleted_at IS NULL', [
+        entry.classId,
+      ]);
+      if (!klass.rows[0]) throw notFound('Class not found.');
+
+      const existing = await client.query(
+        `SELECT fs.id, fs.total_amount, fs.installment_plan,
+                (SELECT count(*)::int FROM student_fees sf WHERE sf.fee_structure_id = fs.id) AS assigned
+           FROM fee_structures fs
+          WHERE fs.academic_year_id = $1 AND fs.class_id = $2 AND fs.category_id = $3
+            AND fs.deleted_at IS NULL
+          FOR UPDATE`,
+        [year.id, entry.classId, payload.categoryId],
+      );
+      const current = existing.rows[0];
+      const amount = Math.round(Number(entry.totalAmount) * 100) / 100;
+      const name = payload.name || `${klass.rows[0].name} fees`;
+
+      if (amount === 0) {
+        if (!current) {
+          results.push({ classId: entry.classId, className: klass.rows[0].name, action: 'skipped' });
+          continue;
+        }
+        if (current.assigned > 0) {
+          throw conflict(
+            `${klass.rows[0].name}: ${current.assigned} student(s) already owe this fee — it cannot be cleared.`,
+            'STRUCTURE_IN_USE',
+          );
+        }
+        await client.query('UPDATE fee_structures SET deleted_at = now() WHERE id = $1', [current.id]);
+        results.push({ classId: entry.classId, className: klass.rows[0].name, action: 'removed' });
+        continue;
+      }
+
+      if (!current) {
+        const created = await client.query(
+          `INSERT INTO fee_structures (academic_year_id, class_id, category_id, name, total_amount, installment_plan)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [year.id, entry.classId, payload.categoryId, name, amount, payload.installmentPlan],
+        );
+        const installments = await writeInstallments(
+          client,
+          created.rows[0].id,
+          amount,
+          payload.installmentPlan,
+          year.start_date,
+        );
+        results.push({
+          classId: entry.classId,
+          className: klass.rows[0].name,
+          structureId: created.rows[0].id,
+          totalAmount: amount,
+          installments,
+          action: 'created',
+        });
+        continue;
+      }
+
+      const changed =
+        Number(current.total_amount) !== amount || current.installment_plan !== payload.installmentPlan;
+      if (changed && current.assigned > 0) {
+        if (!payload.recostExisting) {
+          throw conflict(
+            `${klass.rows[0].name}: ${current.assigned} student(s) already owe ₹${Number(current.total_amount).toFixed(2)} — ` +
+              'changing the amount now would rewrite their ledger. Send recostExisting to re-price them as well.',
+            'STRUCTURE_IN_USE',
+          );
+        }
+        /**
+         * Re-costing an assigned structure is allowed, but never into a negative balance:
+         * if any student already paid more than the new amount, their ledger would go below zero,
+         * so that class is refused instead of silently producing a credit.
+         */
+        const overpaid = await client.query(
+          `SELECT count(*)::int AS n FROM student_fees sf
+            WHERE sf.fee_structure_id = $1
+              AND (SELECT coalesce(sum(p.amount), 0) FROM fee_payments p WHERE p.student_fee_id = sf.id) > $2`,
+          [current.id, amount],
+        );
+        if (overpaid.rows[0].n > 0) {
+          throw conflict(
+            `${klass.rows[0].name}: ${overpaid.rows[0].n} student(s) have already paid more than ₹${amount.toFixed(2)} — ` +
+              'a re-price would push their balance below zero. Refund/reverse first, then re-cost.',
+            'RECOST_NEGATIVE',
+          );
+        }
+        await client.query('UPDATE student_fees SET gross_amount = $2 WHERE fee_structure_id = $1', [
+          current.id,
+          amount,
+        ]);
+      }
+      if (changed) {
+        await client.query(
+          `UPDATE fee_structures SET total_amount = $2, installment_plan = $3, name = $4 WHERE id = $1`,
+          [current.id, amount, payload.installmentPlan, name],
+        );
+        await client.query('DELETE FROM fee_installments WHERE fee_structure_id = $1', [current.id]);
+        await writeInstallments(client, current.id, amount, payload.installmentPlan, year.start_date);
+      }
+      results.push({
+        classId: entry.classId,
+        className: klass.rows[0].name,
+        structureId: current.id,
+        totalAmount: amount,
+        installments: PLAN_STEPS[payload.installmentPlan].count,
+        action: changed ? 'updated' : 'unchanged',
+      });
+    }
+
+    await audit({
+      client,
+      actorUserId: actor?.id,
+      actorRole: actor?.role,
+      action: 'fee_structure.bulk_saved',
+      entityType: 'fee_structures',
+      newValues: { categoryId: payload.categoryId, plan: payload.installmentPlan, entries: results },
+      ip,
+      userAgent,
+    });
+    return results;
+  });
 }
 
 export async function deleteStructure(structureId, actor, ip, userAgent) {
@@ -266,9 +441,19 @@ export async function recordPayment({ studentFeeId, amount, paymentMode, referen
     );
     if (!fee.rows[0]) throw notFound('Fee record not found.');
 
-    const due = Number(fee.rows[0].payable_amount) - Number(fee.rows[0].paid);
-    if (value > due + 0.01) {
-      throw conflict(`The outstanding amount is ₹${due.toFixed(2)}.`, 'OVERPAYMENT');
+    /**
+     * Never let a ledger go negative: a payment larger than what is due is refused outright
+     * (the old 1-paisa slack could leave the balance at -0.01 after rounding).
+     */
+    const due = Math.round((Number(fee.rows[0].payable_amount) - Number(fee.rows[0].paid)) * 100) / 100;
+    if (due <= 0) {
+      throw conflict('This fee is already fully paid — nothing is outstanding.', 'ALREADY_PAID');
+    }
+    if (value - due > 0.004) {
+      throw conflict(
+        `A payment cannot exceed the outstanding amount (₹${due.toFixed(2)}).`,
+        'OVERPAYMENT',
+      );
     }
 
     const payment = await client.query(

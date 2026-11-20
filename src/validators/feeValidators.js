@@ -5,11 +5,33 @@ const DATE = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use a valid date');
 const MONEY = z.coerce.number().min(0).max(10000000);
 
 export const PAYMENT_MODES = ['cash', 'cheque', 'bank_transfer', 'upi', 'card'];
-export const PLANS = ['monthly', 'quarterly', 'term', 'one_time'];
+/** Payment frequencies the school can pick per structure. */
+export const PLANS = ['monthly', 'quarterly', 'half_yearly', 'term', 'one_time'];
 
 export const categorySchema = z.object({
   name: z.string().trim().min(1, 'Required').max(60),
   code: z.string().trim().min(1, 'Required').max(12).regex(/^[A-Za-z]+$/, 'Letters only'),
+});
+
+/**
+ * Class-wise setup: one category + one plan, an amount per class. This is how a real school
+ * enters "Class 1 ₹18,000 · Class 2 ₹20,000 …" in one screen instead of fifteen forms.
+ */
+export const bulkStructureSchema = z.object({
+  categoryId: z.coerce.number().int().positive(),
+  installmentPlan: z.enum(PLANS),
+  name: z.string().trim().min(1).max(80).optional(),
+  /** Allow re-pricing a structure that students already owe against (their ledger is updated too). */
+  recostExisting: z.boolean().optional(),
+  entries: z
+    .array(
+      z.object({
+        classId: z.coerce.number().int().positive(),
+        totalAmount: z.coerce.number().min(0).max(10_000_000),
+      }),
+    )
+    .min(1)
+    .max(30),
 });
 
 export const structureSchema = z.object({

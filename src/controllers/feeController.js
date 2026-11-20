@@ -4,6 +4,7 @@ import { parseBody, parsePagination } from '../utils/request.js';
 import * as fees from '../services/feeService.js';
 import {
   assignSchema,
+  bulkStructureSchema,
   categorySchema,
   paymentSchema,
   reversalSchema,
@@ -28,6 +29,16 @@ export const structures = asyncHandler(async (_req, res) => {
 export const createStructure = asyncHandler(async (req, res) => {
   const payload = parseBody(structureSchema, req.body);
   res.status(201).json({ success: true, data: await fees.createStructure(payload, req.user, req.ip, req.headers['user-agent']) });
+});
+
+export const bulkStructures = asyncHandler(async (req, res) => {
+  const payload = parseBody(bulkStructureSchema, req.body);
+  res.json({
+    success: true,
+    data: {
+      results: await fees.bulkStructures(payload, req.user, req.ip, req.get('user-agent')),
+    },
+  });
 });
 
 export const deleteStructure = asyncHandler(async (req, res) => {
