@@ -18,7 +18,8 @@ export const categorySchema = z.object({
  * enters "Class 1 ₹18,000 · Class 2 ₹20,000 …" in one screen instead of fifteen forms.
  */
 export const bulkStructureSchema = z.object({
-  categoryId: z.coerce.number().int().positive(),
+  /** Optional: without it the structure is the class's single total fee. */
+  categoryId: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional(),
   installmentPlan: z.enum(PLANS),
   name: z.string().trim().min(1).max(80).optional(),
   /** Allow re-pricing a structure that students already owe against (their ledger is updated too). */
@@ -37,7 +38,7 @@ export const bulkStructureSchema = z.object({
 export const structureSchema = z.object({
   name: z.string().trim().min(2, 'Required').max(80),
   classId: ID,
-  categoryId: ID,
+  categoryId: z.union([ID, z.literal(''), z.null()]).optional(),
   totalAmount: MONEY,
   installmentPlan: z.enum(PLANS),
 });

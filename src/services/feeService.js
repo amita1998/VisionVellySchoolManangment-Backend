@@ -18,14 +18,14 @@ async function studentFeeRows(studentId, yearId, client = null) {
   const { rows } = await runner(
     `SELECT sf.id, sf.gross_amount, sf.concession_amount, sf.concession_reason, sf.payable_amount,
             fs.name AS structure_name, fs.installment_plan,
-            fc.name AS category, c.name AS class_name,
+            coalesce(fc.name, 'Total fee') AS category, c.name AS class_name,
             coalesce((SELECT sum(p.amount) FROM fee_payments p WHERE p.student_fee_id = sf.id), 0)::numeric AS paid
        FROM student_fees sf
        JOIN fee_structures fs ON fs.id = sf.fee_structure_id
-       JOIN fee_categories fc ON fc.id = fs.category_id
+       LEFT JOIN fee_categories fc ON fc.id = fs.category_id
        JOIN classes c ON c.id = fs.class_id
       WHERE sf.student_id = $1 AND sf.academic_year_id = $2
-      ORDER BY fc.name`,
+      ORDER BY coalesce(fc.name, 'Total fee')`,
     [studentId, yearId],
   );
   return rows;
@@ -100,13 +100,13 @@ export async function listStructures() {
   const year = await currentYear();
   const { rows } = await query(
     `SELECT fs.id, fs.name, fs.total_amount, fs.installment_plan, fs.is_active,
-            fc.name AS category, c.name AS class_name, c.id AS class_id,
+            coalesce(fc.name, 'Total fee') AS category, c.name AS class_name, c.id AS class_id,
             (SELECT count(*)::int FROM student_fees sf WHERE sf.fee_structure_id = fs.id) AS assigned,
             COALESCE((SELECT json_agg(json_build_object('seq', fi.seq, 'label', fi.label,
                      'due', to_char(fi.due_date, 'DD-MM-YYYY'), 'amount', fi.amount) ORDER BY fi.seq)
                         FROM fee_installments fi WHERE fi.fee_structure_id = fs.id), '[]'::json) AS installments
        FROM fee_structures fs
-       JOIN fee_categories fc ON fc.id = fs.category_id
+       LEFT JOIN fee_categories fc ON fc.id = fs.category_id
        JOIN classes c ON c.id = fs.class_id
       WHERE fs.academic_year_id = $1 AND fs.deleted_at IS NULL
       ORDER BY c.level_order, fc.name`,
@@ -160,7 +160,7 @@ export async function createStructure(payload, actor, ip, userAgent) {
       const structure = await client.query(
         `INSERT INTO fee_structures (academic_year_id, class_id, category_id, name, total_amount, installment_plan)
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, total_amount`,
-        [year.id, payload.classId, payload.categoryId, payload.name, payload.totalAmount, payload.installmentPlan],
+        [year.id, payload.classId, payload.categoryId ?? null, payload.name, payload.totalAmount, payload.installmentPlan],
       );
       const per = Math.round((Number(payload.totalAmount) / planCount) * 100) / 100;
       const start = new Date(`${year.start_date}T00:00:00Z`);
@@ -218,6 +218,8 @@ export async function bulkStructures(payload, actor, ip, userAgent) {
   const year = await currentYear();
   if (!year) throw conflict('No current academic year is configured.', 'NO_ACADEMIC_YEAR');
   if (!PLAN_STEPS[payload.installmentPlan]) throw conflict('Unknown installment plan.', 'BAD_PLAN');
+  /** One total per class: no category dimension (kept only for legacy rows). */
+  const categoryId = payload.categoryId ?? null;
 
   return withTransaction(async (client) => {
     const results = [];
@@ -231,10 +233,11 @@ export async function bulkStructures(payload, actor, ip, userAgent) {
         `SELECT fs.id, fs.total_amount, fs.installment_plan,
                 (SELECT count(*)::int FROM student_fees sf WHERE sf.fee_structure_id = fs.id) AS assigned
            FROM fee_structures fs
-          WHERE fs.academic_year_id = $1 AND fs.class_id = $2 AND fs.category_id = $3
+          WHERE fs.academic_year_id = $1 AND fs.class_id = $2
+            AND fs.category_id IS NOT DISTINCT FROM $3::int
             AND fs.deleted_at IS NULL
           FOR UPDATE`,
-        [year.id, entry.classId, payload.categoryId],
+        [year.id, entry.classId, categoryId],
       );
       const current = existing.rows[0];
       const amount = Math.round(Number(entry.totalAmount) * 100) / 100;
@@ -260,7 +263,7 @@ export async function bulkStructures(payload, actor, ip, userAgent) {
         const created = await client.query(
           `INSERT INTO fee_structures (academic_year_id, class_id, category_id, name, total_amount, installment_plan)
            VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-          [year.id, entry.classId, payload.categoryId, name, amount, payload.installmentPlan],
+          [year.id, entry.classId, categoryId, name, amount, payload.installmentPlan],
         );
         const installments = await writeInstallments(
           client,
@@ -337,7 +340,7 @@ export async function bulkStructures(payload, actor, ip, userAgent) {
       actorRole: actor?.role,
       action: 'fee_structure.bulk_saved',
       entityType: 'fee_structures',
-      newValues: { categoryId: payload.categoryId, plan: payload.installmentPlan, entries: results },
+      newValues: { plan: payload.installmentPlan, entries: results },
       ip,
       userAgent,
     });
@@ -567,7 +570,7 @@ export async function listPayments({ from, to, search, page, limit, offset }) {
          JOIN student_fees sf ON sf.id = p.student_fee_id
          JOIN students st ON st.id = sf.student_id
          JOIN fee_structures fs ON fs.id = sf.fee_structure_id
-         JOIN fee_categories fc ON fc.id = fs.category_id
+         LEFT JOIN fee_categories fc ON fc.id = fs.category_id
          LEFT JOIN fee_receipts r ON r.payment_id = p.id
         WHERE ${filters}
         ORDER BY p.paid_on DESC, p.id DESC

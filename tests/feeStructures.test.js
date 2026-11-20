@@ -50,9 +50,8 @@ before(async () => {
   const other = await pool.query(`INSERT INTO classes (name, level_order) VALUES ('Class 6', 4) RETURNING id`);
   ids.otherClassId = other.rows[0].id;
 
-  const cat = await call('POST', '/api/fees/categories', { body: { name: 'Tuition', code: 'TUI' } });
-  assert.ok([200, 201].includes(cat.status), JSON.stringify(cat.body));
-  categoryId = cat.body.data.category?.id ?? cat.body.data.id;
+  // one total fee per class: no category involved
+  categoryId = null;
 });
 
 after(async () => {
@@ -64,7 +63,6 @@ describe('class-wise fee structure', () => {
   it('saves a different amount for each class in one call', async () => {
     const res = await call('POST', '/api/fees/structures/bulk', {
       body: {
-        categoryId,
         installmentPlan: 'quarterly',
         entries: [
           { classId: ids.classId, totalAmount: 18000 },
@@ -97,7 +95,7 @@ describe('class-wise fee structure', () => {
 
   it('supports half-yearly (2) and yearly (1) plans', async () => {
     const half = await call('POST', '/api/fees/structures/bulk', {
-      body: { categoryId, installmentPlan: 'half_yearly', entries: [{ classId: ids.classId, totalAmount: 12000 }] },
+      body: { installmentPlan: 'half_yearly', entries: [{ classId: ids.classId, totalAmount: 12000 }] },
     });
     assert.equal(half.status, 200);
     assert.equal(half.body.data.results[0].action, 'updated');
@@ -111,7 +109,7 @@ describe('class-wise fee structure', () => {
     assert.equal(Number(halfRows.rows[0].amount) + Number(halfRows.rows[1].amount), 12000);
 
     const yearly = await call('POST', '/api/fees/structures/bulk', {
-      body: { categoryId, installmentPlan: 'one_time', entries: [{ classId: ids.classId, totalAmount: 9000 }] },
+      body: { installmentPlan: 'one_time', entries: [{ classId: ids.classId, totalAmount: 9000 }] },
     });
     assert.equal(yearly.status, 200);
     const yearlyRows = await pool.query(
@@ -131,7 +129,7 @@ describe('class-wise fee structure', () => {
     assert.ok([200, 201].includes(assigned.status), JSON.stringify(assigned.body));
 
     const res = await call('POST', '/api/fees/structures/bulk', {
-      body: { categoryId, installmentPlan: 'quarterly', entries: [{ classId: ids.classId, totalAmount: 30000 }] },
+      body: { installmentPlan: 'quarterly', entries: [{ classId: ids.classId, totalAmount: 30000 }] },
     });
     assert.equal(res.status, 409);
     assert.equal(res.body.error.code, 'STRUCTURE_IN_USE');
@@ -139,7 +137,6 @@ describe('class-wise fee structure', () => {
     // Explicit re-cost is allowed and rewrites the student's payable amount with it.
     const recost = await call('POST', '/api/fees/structures/bulk', {
       body: {
-        categoryId,
         installmentPlan: 'half_yearly',
         recostExisting: true,
         entries: [{ classId: ids.classId, totalAmount: 30000 }],
