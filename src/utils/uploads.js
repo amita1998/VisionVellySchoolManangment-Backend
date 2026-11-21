@@ -31,6 +31,30 @@ export const upload = multer({
   },
 });
 
+/** Magic-number check — the browser's Content-Type is attacker-controlled. */
+const SIGNATURES = [
+  { mime: 'application/pdf', ext: '.pdf', test: (b) => b.subarray(0, 4).toString('latin1') === '%PDF' },
+  { mime: 'image/png', ext: '.png', test: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47 },
+  { mime: 'image/jpeg', ext: '.jpg', test: (b) => b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
+];
+
+export function sniffFileType(buffer) {
+  return SIGNATURES.find((signature) => buffer && buffer.length >= 4 && signature.test(buffer)) ?? null;
+}
+
+/** Throws the same 400 the mimetype filter uses when the bytes disagree with the declared type. */
+export function assertRealFileType(file) {
+  const sniffed = sniffFileType(file.buffer);
+  if (!sniffed || sniffed.mime !== file.mimetype) {
+    throw new AppError(
+      400,
+      'UNSUPPORTED_FILE_TYPE',
+      'That file is not a real PDF, JPG or PNG — its contents do not match its name.',
+    );
+  }
+  return sniffed;
+}
+
 export function safeFileName(originalName) {
   const base = path
     .basename(originalName || 'file')
@@ -48,10 +72,11 @@ export function absolutePath(relativePath) {
  * `documents` (path is relative so the storage root can move).
  */
 export async function saveUpload({ file, folder }) {
+  const sniffed = assertRealFileType(file);
   const directory = path.join(config.uploads.dir, folder);
   try {
     await fs.mkdir(directory, { recursive: true });
-    const fileName = safeFileName(file.originalname);
+    const fileName = safeFileName(file.originalname).replace(/\.[^.]+$/, sniffed.ext);
     const relative = path.posix.join(folder, fileName);
     await fs.writeFile(path.join(directory, fileName), file.buffer, { mode: 0o640 });
     return {

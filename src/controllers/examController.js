@@ -15,7 +15,16 @@ const meta = (req) => ({ actor: req.user, ip: req.ip, userAgent: req.headers['us
 
 // ---------- exams ----------
 export const list = asyncHandler(async (req, res) => {
-  res.json({ success: true, data: { exams: await exams.listExams({ yearId: req.query.yearId ? Number(req.query.yearId) : null }) } });
+  const staff = ['admin', 'teacher'].includes(req.user.role);
+  res.json({
+    success: true,
+    data: {
+      exams: await exams.listExams({
+        yearId: req.query.yearId ? Number(req.query.yearId) : null,
+        includeDrafts: staff,
+      }),
+    },
+  });
 });
 
 export const create = asyncHandler(async (req, res) => {
@@ -111,7 +120,7 @@ export const override = asyncHandler(async (req, res) => {
 });
 
 // ---------- results / report cards ----------
-async function assertCanViewStudent(req, studentId) {
+async function assertCanViewStudent(req, studentId, yearId = null) {
   const { role, id: userId } = req.user;
   if (role === 'admin') return;
   if (role === 'student') {
@@ -131,8 +140,10 @@ async function assertCanViewStudent(req, studentId) {
       `SELECT 1 FROM enrollments e
          JOIN teacher_subjects ts ON ts.class_id = e.class_id
          JOIN teachers t ON t.id = ts.teacher_id
-        WHERE e.student_id = $1 AND t.user_id = $2 LIMIT 1`,
-      [studentId, userId],
+        WHERE e.student_id = $1 AND t.user_id = $2
+          AND ($3::int IS NULL OR ts.academic_year_id = $3)
+        LIMIT 1`,
+      [studentId, userId, yearId],
     );
     if (teaches.rows[0]) return;
   }
@@ -151,7 +162,8 @@ export const reportCard = asyncHandler(async (req, res) => {
   const examId = Number(req.query.examId);
   if (!examId) throw badRequest('examId is required');
 
-  await assertCanViewStudent(req, studentId);
+  const yearRow = await query('SELECT academic_year_id FROM examinations WHERE id = $1', [examId]);
+  await assertCanViewStudent(req, studentId, yearRow.rows[0]?.academic_year_id ?? null);
   const card = await exams.reportCard({ studentId, examId });
 
   // Students and parents only see published results.

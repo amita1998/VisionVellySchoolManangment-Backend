@@ -20,10 +20,23 @@ async function serverToday(client = null) {
   const runner = client ? client.query.bind(client) : query;
   const { rows } = await runner(
     `SELECT (now() AT TIME ZONE $1)::date AS today,
-            to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today_iso`,
+            to_char((now() AT TIME ZONE $1)::date, 'YYYY-MM-DD') AS today_iso,
+            (now() AT TIME ZONE $1)::time AS now_time,
+            coalesce((SELECT attendance_lock_time FROM school_settings WHERE id = 1), '23:59') AS lock_time`,
     [config.timezone],
   );
   return rows[0];
+}
+
+/**
+ * Is this day still editable? A past day is closed; today is open until the school's own
+ * `attendance_lock_time` (Admin → Settings), which used to be ignored while the code hard-coded
+ * midnight.
+ */
+function isLocked(todayRow, day) {
+  if (day < todayRow.today_iso) return true;
+  if (day > todayRow.today_iso) return false;
+  return todayRow.now_time >= todayRow.lock_time;
 }
 
 async function classTeacherSections(userId, yearId) {
@@ -94,13 +107,14 @@ export async function markingSheet({ userId, role, sectionId, date }) {
     [sectionId, year.id, day],
   );
 
+  const locked = isLocked(today, day);
   return {
     section: section.rows[0],
     date: day,
     today: today.today_iso,
-    // A past day is locked. Today is editable until the clock rolls over in IST.
-    locked: day < today.today_iso,
-    canMark: !isAdmin && !(day < today.today_iso),
+    lockTime: String(today.lock_time).slice(0, 5),
+    locked,
+    canMark: !isAdmin && !locked,
     students: rows.map((row) => ({
       studentId: row.student_id,
       admissionId: row.admission_id,
@@ -137,12 +151,16 @@ export async function markAttendance({ userId, sectionId, date, entries, ip, use
   if (!year) throw conflict('No current academic year is configured.', 'NO_ACADEMIC_YEAR');
   const today = await serverToday();
 
-  if (date !== today.today_iso) {
+  if (date < today.today_iso) {
+    throw conflict('That day is locked. Submit a correction request instead.', 'ATTENDANCE_LOCKED');
+  }
+  if (date > today.today_iso) {
+    throw conflict('Attendance can only be marked for today.', 'FUTURE_DATE');
+  }
+  if (isLocked(today, date)) {
     throw conflict(
-      date < today.today_iso
-        ? 'That day is locked. Submit a correction request instead.'
-        : 'Attendance can only be marked for today.',
-      date < today.today_iso ? 'ATTENDANCE_LOCKED' : 'FUTURE_DATE',
+      `Today's register closed at ${String(today.lock_time).slice(0, 5)}. Submit a correction request instead.`,
+      'ATTENDANCE_LOCKED',
     );
   }
 
@@ -162,20 +180,21 @@ export async function markAttendance({ userId, sectionId, date, entries, ip, use
   }
 
   const saved = await withTransaction(async (client) => {
-    const results = [];
-    for (const entry of entries) {
-      const { rows } = await client.query(
-        `INSERT INTO attendance (student_id, academic_year_id, section_id, attendance_date, status,
-           remarks, marked_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (student_id, attendance_date) DO UPDATE
-           SET status = EXCLUDED.status, remarks = EXCLUDED.remarks,
-               marked_by = EXCLUDED.marked_by, marked_at = now()
-         RETURNING id, student_id, status`,
-        [entry.studentId, year.id, sectionId, date, entry.status, entry.remarks ?? null, userId],
-      );
-      results.push(rows[0]);
-    }
+    // One statement for the whole register (a section can be 300 students).
+    const ids = entries.map((entry) => entry.studentId);
+    const statuses = entries.map((entry) => entry.status);
+    const remarks = entries.map((entry) => entry.remarks ?? null);
+    const { rows: results } = await client.query(
+      `INSERT INTO attendance (student_id, academic_year_id, section_id, attendance_date, status,
+         remarks, marked_by)
+       SELECT s.student_id, $2, $3, $4, s.status::attendance_status, s.remarks, $5
+         FROM unnest($1::int[], $6::text[], $7::text[]) AS s(student_id, status, remarks)
+       ON CONFLICT (student_id, attendance_date) DO UPDATE
+         SET status = EXCLUDED.status, remarks = EXCLUDED.remarks,
+             marked_by = EXCLUDED.marked_by, marked_at = now()
+       RETURNING id, student_id, status`,
+      [ids, year.id, sectionId, date, userId, statuses, remarks],
+    );
 
     await audit({
       client,
@@ -408,13 +427,21 @@ export async function requestCorrection({ userId, attendanceId, requestedStatus,
     throw conflict('A correction for this record is already pending.', 'CORRECTION_PENDING');
   }
 
-  const { rows } = await query(
-    `INSERT INTO attendance_corrections (attendance_id, student_id, old_status, requested_status,
-       reason, requested_by)
-     VALUES ($1, $2, $3, $4, $5, $6)
-     RETURNING id, status, created_at`,
-    [attendanceId, row.student_id, row.status, requestedStatus, reason, userId],
-  );
+  let rows;
+  try {
+    ({ rows } = await query(
+      `INSERT INTO attendance_corrections (attendance_id, student_id, old_status, requested_status,
+         reason, requested_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, status, created_at`,
+      [attendanceId, row.student_id, row.status, requestedStatus, reason, userId],
+    ));
+  } catch (error) {
+    if (error.code === '23505' && error.constraint === 'attendance_corrections_one_pending') {
+      throw conflict('A correction for this record is already pending.', 'CORRECTION_PENDING');
+    }
+    throw error;
+  }
 
   await audit({
     actorUserId: userId,
@@ -437,17 +464,18 @@ export async function listCorrections(req) {
 
   // Build the parameter list together with the SQL: passing a parameter that the
   // statement does not reference makes Postgres reject the whole bind.
-  const params = [status];
+  const year = await currentYear();
+  const params = [status, year?.id ?? 0];
   let scope = '';
   if (role !== 'admin') {
     params.push(userId);
     scope = `AND (
-        c.requested_by = $2
+        c.requested_by = $3
         OR c.attendance_id IN (
              SELECT a.id FROM attendance a
               WHERE a.section_id IN (
                 SELECT ct.section_id FROM class_teachers ct
-                JOIN teachers t ON t.id = ct.teacher_id WHERE t.user_id = $2
+                JOIN teachers t ON t.id = ct.teacher_id WHERE t.user_id = $3
               )
             )
       )`;
@@ -467,6 +495,7 @@ export async function listCorrections(req) {
        JOIN sections s ON s.id = a.section_id
        JOIN classes cl ON cl.id = s.class_id
       WHERE ($1::text IS NULL OR c.status::text = $1)
+        AND a.academic_year_id = $2
         ${scope}
       ORDER BY (c.status = 'pending') DESC, c.created_at DESC
       LIMIT 100`,

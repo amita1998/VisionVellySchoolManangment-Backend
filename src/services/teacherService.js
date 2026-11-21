@@ -377,6 +377,15 @@ export async function assignClassTeacher(teacherId, { sectionId, effectiveFrom }
       ]);
       if (!section.rows[0]) throw notFound('Section not found.');
 
+      const teacher = await client.query(
+        'SELECT id, status FROM teachers WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+        [teacherId],
+      );
+      if (!teacher.rows[0]) throw notFound('Teacher not found.');
+      if (teacher.rows[0].status !== 'active') {
+        throw conflict('Only an active teacher can be a class teacher.', 'TEACHER_NOT_ACTIVE');
+      }
+
       // One class teacher per section per year: replace whoever holds it now.
       await client.query('DELETE FROM class_teachers WHERE academic_year_id = $1 AND section_id = $2', [
         year.id,
@@ -402,10 +411,14 @@ export async function assignClassTeacher(teacherId, { sectionId, effectiveFrom }
     });
   } catch (error) {
     if (error.code === '23505') {
-      throw conflict(
-        'This teacher is already the class teacher of another section.',
-        'TEACHER_ALREADY_CLASS_TEACHER',
-      );
+      // Two different unique keys can fire here; the message has to say which rule was broken.
+      if (error.constraint === 'class_teachers_one_section_per_teacher') {
+        throw conflict(
+          'This teacher is already the class teacher of another section.',
+          'TEACHER_ALREADY_CLASS_TEACHER',
+        );
+      }
+      throw conflict('Another admin just assigned a class teacher to this section. Reload and try again.', 'SECTION_ALREADY_ASSIGNED');
     }
     throw error;
   }

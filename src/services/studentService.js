@@ -63,12 +63,18 @@ async function teacherClassScope(actor) {
 export async function listStudents({ search, classId, sectionId, status, page, limit, offset }, actor) {
   const year = await currentYear();
   const yearId = year?.id ?? 0;
-  const term = search ? `%${search.trim()}%` : null;
+  // The trigram index is on lower(first_name || ' ' || last_name); matching a different expression
+  // (or leaving % and _ live) means a sequential scan and surprise wildcards.
+  const term = search
+    ? `%${search.trim().replace(/[%_]/g, (match) => `\\${match}`).toLowerCase()}%`
+    : null;
   const scope = await teacherClassScope(actor);
 
   const filters = `
     s.deleted_at IS NULL
-    AND ($1::text IS NULL OR (s.first_name || ' ' || s.last_name) ILIKE $1 OR s.admission_id ILIKE $1)
+    AND ($1::text IS NULL
+         OR lower(s.first_name || ' ' || s.last_name) LIKE $1
+         OR lower(s.admission_id) LIKE $1)
     AND ($2::int IS NULL OR e.class_id = $2)
     AND ($3::int IS NULL OR e.section_id = $3)
     AND ($4::text IS NULL OR s.status::text = $4)
@@ -148,7 +154,7 @@ export async function getStudent(studentId) {
     query(
       `SELECT u.username, u.is_active, u.last_login_at, u.must_change_password
          FROM users u WHERE u.id = $1`,
-      [student.user_id],
+      [student.userId],
     ),
   ]);
 
@@ -176,11 +182,6 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
   if (section.rows[0].class_id !== payload.classId) {
     throw conflict('The section does not belong to the selected class.', 'SECTION_CLASS_MISMATCH');
   }
-
-  // One temporary password PER ACCOUNT. A shared one means a parent can sign in as the child (whose
-  // username is the sequential admission id) or as another guardian.
-  const studentPassword = temporaryPassword();
-  const studentHash = await bcrypt.hash(studentPassword, config.auth.bcryptRounds);
 
   // Duplicate guard: the same child admitted twice (double click, or a re-typed form).
   // The database enforces this too (students_identity_unique); this check exists so the
@@ -213,6 +214,11 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
       'STUDENT_EXISTS',
     );
   }
+
+  // One temporary password PER ACCOUNT (a shared one let a parent sign in as the child, whose
+  // username is the sequential admission id). Hashed only after the cheap duplicate check.
+  const studentPassword = temporaryPassword();
+  const studentHash = await bcrypt.hash(studentPassword, config.auth.bcryptRounds);
 
   const writtenFiles = [];
   // Guardian logins created by this admission (an already-existing family account keeps its
@@ -619,6 +625,24 @@ export async function changeStatus(studentId, { status, effectiveDate, remarks }
       [studentId, year?.id ?? null, current.rows[0].status, status, effectiveDate, remarks ?? null, actor?.id ?? null],
     );
 
+    // The enrollment follows the student status: 'student.transferred' with an active enrollment is
+    // what inflated every class list and blocked publishing.
+    const enrollmentStatus = { withdrawn: 'withdrawn', transferred: 'transferred', graduated: 'completed' }[status];
+    if (enrollmentStatus) {
+      await client.query(
+        `UPDATE enrollments SET status = $2::enrollment_status
+          WHERE student_id = $1 AND status = 'active'`,
+        [studentId, enrollmentStatus],
+      );
+    } else if (status === 'active') {
+      await client.query(
+        `UPDATE enrollments SET status = 'active'
+          WHERE student_id = $1 AND status <> 'active'
+            AND academic_year_id = (SELECT id FROM academic_years WHERE is_current AND deleted_at IS NULL LIMIT 1)`,
+        [studentId],
+      );
+    }
+
     // A student who leaves must not keep a working login — and one who comes back must get it again
     // (this used to be one-way: withdrawn -> active left the account disabled for ever).
     if (['transferred', 'withdrawn', 'graduated', 'suspended'].includes(status)) {
@@ -716,6 +740,13 @@ export async function softDeleteStudent(studentId, actor, ip, userAgent) {
       studentId,
       'withdrawn',
     ]);
+    // An enrollment left 'active' keeps the student in the exam publish gate, the ID card and every
+    // class list, even though the student is gone.
+    await client.query(
+      `UPDATE enrollments SET status = 'withdrawn'
+        WHERE student_id = $1 AND status = 'active'`,
+      [studentId],
+    );
     if (existing.rows[0].user_id) {
       await client.query('UPDATE users SET is_active = FALSE, deleted_at = now() WHERE id = $1', [
         existing.rows[0].user_id,

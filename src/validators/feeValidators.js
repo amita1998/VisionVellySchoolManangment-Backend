@@ -1,8 +1,15 @@
 import { z } from 'zod';
+import { config } from '../config/env.js';
 
 const ID = z.union([z.number().int().positive(), z.string().regex(/^\d+$/).transform(Number)]);
 const DATE = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use a valid date');
 const MONEY = z.coerce.number().min(0).max(10000000);
+const schoolToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: config.timezone }).format(new Date());
+/** An empty category input means "no category", not `Number('')`. */
+const OPTIONAL_CATEGORY = z
+  .union([ID, z.literal(''), z.null()])
+  .optional()
+  .transform((value) => (value === '' || value === undefined ? null : value));
 
 export const PAYMENT_MODES = ['cash', 'cheque', 'bank_transfer', 'upi', 'card'];
 /** Payment frequencies the school can pick per structure. */
@@ -19,7 +26,7 @@ export const categorySchema = z.object({
  */
 export const bulkStructureSchema = z.object({
   /** Optional: without it the structure is the class's single total fee. */
-  categoryId: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional(),
+  categoryId: OPTIONAL_CATEGORY,
   installmentPlan: z.enum(PLANS),
   name: z.string().trim().min(1).max(80).optional(),
   /** Allow re-pricing a structure that students already owe against (their ledger is updated too). */
@@ -38,7 +45,7 @@ export const bulkStructureSchema = z.object({
 export const structureSchema = z.object({
   name: z.string().trim().min(2, 'Required').max(80),
   classId: ID,
-  categoryId: z.union([ID, z.literal(''), z.null()]).optional(),
+  categoryId: OPTIONAL_CATEGORY,
   totalAmount: MONEY,
   installmentPlan: z.enum(PLANS),
 });
@@ -61,8 +68,10 @@ export const paymentSchema = z.object({
   amount: MONEY.refine((value) => value > 0, 'Amount must be positive'),
   paymentMode: z.enum(PAYMENT_MODES),
   referenceNo: z.string().trim().max(60).optional().nullable(),
-  paidOn: DATE,
+  paidOn: DATE.refine((value) => value <= schoolToday(), 'A payment cannot be dated in the future'),
   remarks: z.string().trim().max(200).optional().nullable(),
+  /** Generated once when the payment form opens; a retry answers with the same receipt. */
+  idempotencyKey: z.string().uuid().optional().nullable(),
 });
 
 export const reversalSchema = z.object({

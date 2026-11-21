@@ -1,4 +1,5 @@
 import { query, withTransaction } from '../config/db.js';
+import { config } from '../config/env.js';
 import { conflict, forbidden, notFound } from '../utils/errors.js';
 import { audit } from './auditService.js';
 import { currentYear } from './academicsService.js';
@@ -130,8 +131,11 @@ async function writeInstallments(client, structureId, totalAmount, plan, yearSta
   const per = Math.round((Number(totalAmount) / count) * 100) / 100;
   const start = new Date(`${yearStart}T00:00:00Z`);
   for (let index = 0; index < count; index += 1) {
-    const due = new Date(start);
-    if (months) due.setUTCMonth(due.getUTCMonth() + index * months);
+    // Adding months to the 29th-31st rolls into the next month ("31 Feb" -> 3 March). Clamp to the
+    // last day of the target month instead.
+    const due = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + index * months, 1));
+    const lastDay = new Date(Date.UTC(due.getUTCFullYear(), due.getUTCMonth() + 1, 0)).getUTCDate();
+    due.setUTCDate(Math.min(start.getUTCDate(), lastDay));
     await client.query(
       `INSERT INTO fee_installments (fee_structure_id, seq, label, due_date, amount)
        VALUES ($1, $2, $3, $4, $5)`,
@@ -162,39 +166,7 @@ export async function createStructure(payload, actor, ip, userAgent) {
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, total_amount`,
         [year.id, payload.classId, payload.categoryId ?? null, payload.name, payload.totalAmount, payload.installmentPlan],
       );
-      const per = Math.round((Number(payload.totalAmount) / planCount) * 100) / 100;
-      const start = new Date(`${year.start_date}T00:00:00Z`);
-      for (let index = 0; index < planCount; index += 1) {
-        const due = new Date(start);
-        if (payload.installmentPlan === 'monthly') due.setUTCMonth(due.getUTCMonth() + index);
-        else if (payload.installmentPlan === 'quarterly') due.setUTCMonth(due.getUTCMonth() + index * 3);
-        else if (payload.installmentPlan === 'half_yearly') due.setUTCMonth(due.getUTCMonth() + index * 6);
-        else if (payload.installmentPlan === 'term') due.setUTCMonth(due.getUTCMonth() + index * 4);
-        await client.query(
-          `INSERT INTO fee_installments (fee_structure_id, seq, label, due_date, amount)
-           VALUES ($1, $2, $3, $4, $5)`,
-          [
-            structure.rows[0].id,
-            index + 1,
-            payload.installmentPlan === 'one_time' ? 'Full payment' : `${index + 1}/${planCount}`,
-            due.toISOString().slice(0, 10),
-            index === planCount - 1
-              ? Math.round((Number(payload.totalAmount) - per * (planCount - 1)) * 100) / 100
-              : per,
-          ],
-        );
-      }
-      await audit({
-        client,
-        actorUserId: actor?.id,
-        actorRole: actor?.role,
-        action: 'fee_structure.created',
-        entityType: 'fee_structures',
-        entityId: structure.rows[0].id,
-        newValues: payload,
-        ip,
-        userAgent,
-      });
+      await writeInstallments(client, structure.rows[0].id, payload.totalAmount, payload.installmentPlan, year.start_date);
       return structure.rows[0];
     });
   } catch (error) {
@@ -301,7 +273,8 @@ export async function bulkStructures(payload, actor, ip, userAgent) {
         const overpaid = await client.query(
           `SELECT count(*)::int AS n FROM student_fees sf
             WHERE sf.fee_structure_id = $1
-              AND (SELECT coalesce(sum(p.amount), 0) FROM fee_payments p WHERE p.student_fee_id = sf.id) > $2`,
+              AND (SELECT coalesce(sum(p.amount), 0) FROM fee_payments p WHERE p.student_fee_id = sf.id)
+                  > ($2::numeric - sf.concession_amount)`,
           [current.id, amount],
         );
         if (overpaid.rows[0].n > 0) {
@@ -311,10 +284,13 @@ export async function bulkStructures(payload, actor, ip, userAgent) {
             'RECOST_NEGATIVE',
           );
         }
-        await client.query('UPDATE student_fees SET gross_amount = $2 WHERE fee_structure_id = $1', [
-          current.id,
-          amount,
-        ]);
+        await client.query(
+          `UPDATE student_fees
+              SET gross_amount = $2,
+                  concession_amount = least(concession_amount, $2::numeric)
+            WHERE fee_structure_id = $1`,
+          [current.id, amount],
+        );
       }
       if (changed) {
         await client.query(
@@ -349,17 +325,20 @@ export async function bulkStructures(payload, actor, ip, userAgent) {
 }
 
 export async function deleteStructure(structureId, actor, ip, userAgent) {
-  const used = await query('SELECT count(*)::int AS total FROM student_fees WHERE fee_structure_id = $1', [
-    structureId,
-  ]);
-  if (used.rows[0].total > 0) {
-    throw conflict('Students are already assigned to this structure.', 'STRUCTURE_IN_USE');
-  }
-  const { rowCount } = await query(
-    'UPDATE fee_structures SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL',
-    [structureId],
-  );
-  if (rowCount === 0) throw notFound('Structure not found.');
+  await withTransaction(async (client) => {
+    const locked = await client.query(
+      'SELECT id FROM fee_structures WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+      [structureId],
+    );
+    if (!locked.rows[0]) throw notFound('Structure not found.');
+    const used = await client.query('SELECT count(*)::int AS total FROM student_fees WHERE fee_structure_id = $1', [
+      structureId,
+    ]);
+    if (used.rows[0].total > 0) {
+      throw conflict('Students are already assigned to this structure.', 'STRUCTURE_IN_USE');
+    }
+    await client.query('UPDATE fee_structures SET deleted_at = now() WHERE id = $1', [structureId]);
+  });
   await audit({ actorUserId: actor?.id, actorRole: actor?.role, action: 'fee_structure.deleted', entityType: 'fee_structures', entityId: structureId, ip, userAgent });
   return { deleted: true };
 }
@@ -371,7 +350,7 @@ export async function deleteStructure(structureId, actor, ip, userAgent) {
 export async function assignFees({ structureId, studentIds = [], classId, concession, reason }, actor, ip, userAgent) {
   const year = await currentYear();
   const structure = await query(
-    'SELECT id, class_id, total_amount FROM fee_structures WHERE id = $1 AND deleted_at IS NULL',
+    'SELECT id, class_id, total_amount, academic_year_id FROM fee_structures WHERE id = $1 AND deleted_at IS NULL',
     [structureId],
   );
   if (!structure.rows[0]) throw notFound('Fee structure not found.');
@@ -379,15 +358,8 @@ export async function assignFees({ structureId, studentIds = [], classId, conces
     throw conflict('The structure belongs to another class.', 'CLASS_MISMATCH');
   }
 
-  let targets = studentIds;
-  if (!targets.length && classId) {
-    const enrolled = await query(
-      "SELECT student_id FROM enrollments WHERE class_id = $1 AND academic_year_id = $2 AND status = 'active'",
-      [structure.rows[0].class_id, year?.id ?? 0],
-    );
-    targets = enrolled.rows.map((row) => row.student_id);
-  }
-  if (!targets.length) throw conflict('No students to assign.', 'NO_STUDENTS');
+  // The structure carries its own academic year; the "current" year is not necessarily the same one.
+  const structureYear = structure.rows[0].academic_year_id ?? year?.id ?? 0;
 
   const concessionValue = Number(concession || 0);
   const gross = Number(structure.rows[0].total_amount);
@@ -396,16 +368,39 @@ export async function assignFees({ structureId, studentIds = [], classId, conces
   }
 
   const inserted = await withTransaction(async (client) => {
-    let count = 0;
-    for (const studentId of targets) {
-      const { rowCount } = await client.query(
-        `INSERT INTO student_fees (student_id, academic_year_id, fee_structure_id, gross_amount,
-           concession_amount, concession_reason)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (student_id, fee_structure_id) DO NOTHING`,
-        [studentId, year?.id ?? 0, structureId, gross, concessionValue, reason ?? null],
+    // One INSERT … SELECT: the roster is the join, so a student id from another class can never be
+    // charged and 500 rows are one round trip instead of 500.
+    const { rowCount: count } = await client.query(
+      `INSERT INTO student_fees (student_id, academic_year_id, fee_structure_id, gross_amount,
+         concession_amount, concession_reason)
+       SELECT e.student_id, $2, $3, $4, $5, $6
+         FROM enrollments e
+         JOIN students st ON st.id = e.student_id
+        WHERE e.class_id = $1
+          AND e.academic_year_id = $2
+          AND e.status = 'active'
+          AND st.deleted_at IS NULL
+          AND st.status NOT IN ('withdrawn', 'transferred', 'graduated')
+          AND ($7::int[] IS NULL OR e.student_id = ANY($7::int[]))
+       ON CONFLICT (student_id, fee_structure_id) DO NOTHING`,
+      [
+        structure.rows[0].class_id,
+        structureYear,
+        structureId,
+        gross,
+        concessionValue,
+        reason ?? null,
+        studentIds && studentIds.length ? studentIds.map(Number) : null,
+      ],
+    );
+
+    const targets = count ?? 0;
+    if (targets === 0) {
+      const exists = await client.query(
+        'SELECT 1 FROM student_fees WHERE fee_structure_id = $1 LIMIT 1',
+        [structureId],
       );
-      count += rowCount;
+      if (!exists.rows[0]) throw conflict('No students to assign.', 'NO_STUDENTS');
     }
     await audit({
       client,
@@ -414,25 +409,45 @@ export async function assignFees({ structureId, studentIds = [], classId, conces
       action: 'fees.assigned',
       entityType: 'fee_structures',
       entityId: structureId,
-      newValues: { students: targets.length, created: count, concession: concessionValue },
+      newValues: { students: count, created: count, concession: concessionValue },
       ip,
       userAgent,
     });
     return count;
   });
 
-  return { assigned: inserted, requested: targets.length };
+  return { assigned: inserted, requested: inserted };
 }
 
 // ---------------------------------------------------------------------------
 // Payments and reversals
 // ---------------------------------------------------------------------------
 
-export async function recordPayment({ studentFeeId, amount, paymentMode, referenceNo, paidOn, remarks }, actor, ip, userAgent) {
+export async function recordPayment({ studentFeeId, amount, paymentMode, referenceNo, paidOn, remarks, idempotencyKey = null }, actor, ip, userAgent) {
   const value = Math.round(Number(amount) * 100) / 100;
   if (!Number.isFinite(value) || value <= 0) throw conflict('Enter a positive amount.', 'BAD_AMOUNT');
   if (paymentMode !== 'cash' && !referenceNo) {
     throw conflict(`A ${paymentMode.replace('_', ' ')} payment needs a reference number.`, 'REFERENCE_REQUIRED');
+  }
+
+  // A double-clicked Save or a retried request carries the same key: answer with the payment and
+  // receipt that already exist instead of writing a second pair.
+  if (idempotencyKey) {
+    const existing = await query(
+      `SELECT p.id, p.amount, p.payment_mode, to_char(p.paid_on, 'DD-MM-YYYY') AS paid_on,
+              r.id AS receipt_id, r.receipt_no, to_char(r.issued_on, 'DD-MM-YYYY') AS issued_on
+         FROM fee_payments p
+         LEFT JOIN fee_receipts r ON r.payment_id = p.id
+        WHERE p.idempotency_key = $1`,
+      [idempotencyKey],
+    );
+    if (existing.rows[0]) {
+      return {
+        payment: existing.rows[0],
+        receipt: { id: existing.rows[0].receipt_id, receipt_no: existing.rows[0].receipt_no, amount: existing.rows[0].amount, issued_on: existing.rows[0].issued_on },
+        replayed: true,
+      };
+    }
   }
 
   return withTransaction(async (client) => {
@@ -460,10 +475,10 @@ export async function recordPayment({ studentFeeId, amount, paymentMode, referen
     }
 
     const payment = await client.query(
-      `INSERT INTO fee_payments (student_fee_id, amount, payment_mode, reference_no, paid_on, remarks, recorded_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO fee_payments (student_fee_id, amount, payment_mode, reference_no, paid_on, remarks, recorded_by, idempotency_key)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING id, amount, payment_mode, to_char(paid_on, 'DD-MM-YYYY') AS paid_on`,
-      [studentFeeId, value, paymentMode, referenceNo ?? null, paidOn, remarks ?? null, actor?.id ?? null],
+      [studentFeeId, value, paymentMode, referenceNo ?? null, paidOn, remarks ?? null, actor?.id ?? null, idempotencyKey],
     );
 
     const receipt = await client.query(
@@ -514,17 +529,18 @@ export async function reversePayment({ paymentId, reason }, actor, ip, userAgent
       `INSERT INTO fee_payments (student_fee_id, amount, payment_mode, paid_on, remarks, recorded_by,
          is_reversal, reversal_of_payment_id, reversal_reason)
        VALUES ($1, $2, (SELECT payment_mode FROM fee_payments WHERE id = $3),
-               (now() AT TIME ZONE 'Asia/Kolkata')::date, $4, $5, TRUE, $3, $4)
+               (now() AT TIME ZONE $6)::date, $4, $5, TRUE, $3, $4)
        RETURNING id, amount`,
-      [payment.rows[0].student_fee_id, -Number(payment.rows[0].amount), paymentId, reason, actor?.id ?? null],
+      [payment.rows[0].student_fee_id, -Number(payment.rows[0].amount), paymentId, reason, actor?.id ?? null, config.timezone],
     );
 
     await client.query(
       `UPDATE fee_receipts
-          SET is_reversed = TRUE, reversed_on = (now() AT TIME ZONE 'Asia/Kolkata')::date,
+          SET is_reversed = TRUE, reversed_on = (now() AT TIME ZONE $3)::date,
               reversed_by_payment_id = $2
         WHERE id = $1`,
-      [receipt.rows[0].id, reversal.rows[0].id],    );
+      [receipt.rows[0].id, reversal.rows[0].id, config.timezone],
+    );
 
     await audit({
       client,

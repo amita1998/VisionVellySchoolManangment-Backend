@@ -480,8 +480,9 @@ async function academicSnapshot(studentId, yearId) {
        JOIN exam_schedules es ON es.id = m.exam_schedule_id
        JOIN examinations ex ON ex.id = es.exam_id
       WHERE m.student_id = $1 AND m.status = 'submitted'
-        AND ex.publish_status = 'published' AND ex.deleted_at IS NULL`,
-    [studentId],
+        AND ex.publish_status = 'published' AND ex.deleted_at IS NULL
+        AND ex.academic_year_id = $2`,
+    [studentId, yearId],
   );
 
   const results = await query(

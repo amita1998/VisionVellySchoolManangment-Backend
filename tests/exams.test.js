@@ -307,11 +307,21 @@ describe('admin override and unlock', () => {
     assert.equal(noReason.status, 400);
     assert.equal(noReason.body.error.code, 'VALIDATION_ERROR');
 
+    // A published exam is read-only: an override must first be un-published (BE-25).
+    const blocked = await call('POST', `/api/exams/marks/${scheduleId}/override`, {
+      token: admin,
+      body: { studentId: ids.studentId, marksObtained: 80, reason: 'Revaluation accepted' },
+    });
+    assert.equal(blocked.status, 409, JSON.stringify(blocked.body));
+    assert.equal(blocked.body.error.code, 'EXAM_PUBLISHED');
+
+    await call('POST', `/api/exams/${examId}/publish`, { token: admin, body: { publish: false } });
+
     const override = await call('POST', `/api/exams/marks/${scheduleId}/override`, {
       token: admin,
       body: { studentId: ids.studentId, marksObtained: 80, reason: 'Revaluation accepted' },
     });
-    assert.equal(override.status, 200);
+    assert.equal(override.status, 200, JSON.stringify(override.body));
 
     const { rows } = await pool.query('SELECT marks_obtained FROM marks WHERE exam_schedule_id = $1 AND student_id = $2', [
       scheduleId,
@@ -326,6 +336,10 @@ describe('admin override and unlock', () => {
     assert.equal(Number(auditRow.rows[0].old_values.marks_obtained), 74);
     assert.equal(Number(auditRow.rows[0].new_values.marksObtained), 80);
     assert.match(auditRow.rows[0].reason, /Revaluation/);
+
+    // put the exam back the way the rest of this file expects it (published)
+    const republished = await call('POST', `/api/exams/${examId}/publish`, { token: admin, body: { publish: true } });
+    assert.equal(republished.status, 200, JSON.stringify(republished.body));
   });
 
   it('blocks teacher marks on a published paper until an admin unlocks it', async () => {

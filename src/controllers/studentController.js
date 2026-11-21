@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { asyncHandler, forbidden } from '../utils/errors.js';
+import { asyncHandler, badRequest, forbidden } from '../utils/errors.js';
 import { parseBody, parsePagination } from '../utils/request.js';
 import { absolutePath, mapUploadError } from '../utils/uploads.js';
 import { query } from '../config/db.js';
@@ -13,6 +13,15 @@ import {
   studentStatusSchema,
   updateStudentSchema,
 } from '../validators/peopleValidators.js';
+
+/** Zod errors here must become the standard 400 envelope, not a raw 500. */
+function parseDocumentTypes(raw) {
+  const parsed = documentTypesSchema.safeParse(raw);
+  if (!parsed.success) {
+    throw badRequest('Check the document types.', { documentTypes: parsed.error.issues[0]?.message ?? 'Invalid' });
+  }
+  return parsed.data || [];
+}
 
 function multipart(req) {
   if (req.is('multipart/form-data')) {
@@ -97,13 +106,22 @@ export const detail = asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   await assertCanView(req, id);
   const student = await students.getStudent(id);
+
+  // Login metadata (username, last login, password flags) and the admin usernames in the status
+  // history are office information; a parent or a student has no use for them.
+  if (req.user.role !== 'admin') {
+    delete student.login;
+    if (Array.isArray(student.statusHistory)) {
+      student.statusHistory = student.statusHistory.map(({ changed_by: _ignored, ...rest }) => rest);
+    }
+  }
   res.json({ success: true, data: student });
 });
 
 export const create = asyncHandler(async (req, res) => {
   const { payload: rawPayload, documentTypes: rawTypes } = multipart(req);
   const payload = parseBody(admissionSchema, rawPayload);
-  const documentTypes = documentTypesSchema.parse(rawTypes) || [];
+  const documentTypes = parseDocumentTypes(rawTypes);
   const result = await students.createStudent({
     payload,
     files: req.files || [],
@@ -171,12 +189,13 @@ export const resetGuardianPassword = asyncHandler(async (req, res) => {
 });
 
 export const addDocuments = asyncHandler(async (req, res) => {
-  let types = [];
+  let rawTypes = [];
   try {
-    types = JSON.parse(req.body.documentTypes || '[]');
+    rawTypes = JSON.parse(req.body.documentTypes || '[]');
   } catch {
-    types = [];
+    rawTypes = [];
   }
+  const types = parseDocumentTypes(rawTypes);
   const inserted = await students.addDocuments(
     Number(req.params.id),
     req.files || [],
@@ -212,9 +231,11 @@ export const downloadDocument = asyncHandler(async (req, res, next) => {
   const size = fs.statSync(filePath).size;
   res.setHeader('Content-Type', document.mime_type);
   res.setHeader('X-Content-Type-Options', 'nosniff');
+  // Downloads are attachments on purpose: a file that slipped through the type checks must never be
+  // rendered inside the app's origin.
   res.setHeader(
     'Content-Disposition',
-    `inline; filename="${path.basename(document.file_name).replace(/"/g, '')}"`,
+    `attachment; filename="${path.basename(document.file_name).replace(/"/g, '')}"`,
   );
 
   const range = parseRange(req.headers.range, size);

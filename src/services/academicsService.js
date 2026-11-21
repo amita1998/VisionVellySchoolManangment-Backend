@@ -262,6 +262,19 @@ export async function deleteSection(sectionId) {
   if (used.rows[0].total > 0) {
     throw conflict('This section still has students enrolled.', 'SECTION_IN_USE');
   }
+  // A section that still has a class teacher or timetable slots is not free: a soft-deleted section
+  // keeps its class_teachers row, which then blocks that teacher's deactivation.
+  const blockers = await query(
+    `SELECT (SELECT count(*)::int FROM class_teachers WHERE section_id = $1) AS teachers,
+            (SELECT count(*)::int FROM timetable_slots WHERE section_id = $1) AS slots`,
+    [sectionId],
+  );
+  if (blockers.rows[0].teachers > 0) {
+    throw conflict('This section still has a class teacher. Clear that first.', 'SECTION_HAS_CLASS_TEACHER');
+  }
+  if (blockers.rows[0].slots > 0) {
+    throw conflict('This section still has timetable periods. Remove them first.', 'SECTION_HAS_TIMETABLE');
+  }
   const { rows } = await query(
     'UPDATE sections SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id',
     [sectionId],

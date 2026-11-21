@@ -125,11 +125,13 @@ export async function studentIdCard(actor, studentId) {
     `SELECT st.id, st.admission_id, st.first_name, st.last_name, st.date_of_birth, st.blood_group,
             st.gender, st.status,
             c.name AS class_name, sec.name AS section_name,
-            (SELECT min(p.mobile) FROM student_parents sp JOIN parents p ON p.id = sp.parent_id
-              WHERE sp.student_id = st.id) AS guardian_mobile,
-            (SELECT max(ay.end_date) FROM academic_years ay WHERE ay.is_current AND ay.deleted_at IS NULL) AS year_end
+            (SELECT p.mobile FROM student_parents sp JOIN parents p ON p.id = sp.parent_id
+              WHERE sp.student_id = st.id ORDER BY sp.is_primary DESC, p.id LIMIT 1) AS guardian_mobile,
+            (SELECT ay.end_date FROM academic_years ay WHERE ay.is_current AND ay.deleted_at IS NULL LIMIT 1) AS year_end
        FROM students st
-       LEFT JOIN enrollments e ON e.student_id = st.id AND e.status = 'active'
+       LEFT JOIN enrollments e ON e.student_id = st.id
+         AND e.status = 'active'
+         AND e.academic_year_id = (SELECT id FROM academic_years WHERE is_current AND deleted_at IS NULL LIMIT 1)
        LEFT JOIN sections sec ON sec.id = e.section_id
        LEFT JOIN classes c ON c.id = sec.class_id
       WHERE st.id = $1 AND st.deleted_at IS NULL`,
@@ -137,6 +139,12 @@ export async function studentIdCard(actor, studentId) {
   );
   const student = rows[0];
   if (!student) throw notFound('Student not found.');
+  if (['withdrawn', 'transferred', 'graduated'].includes(student.status)) {
+    throw conflict('This student has left the school — the identity card is not valid.', 'ID_CARD_NOT_VALID');
+  }
+  if (!student.class_name) {
+    throw conflict('This student has no active class this year.', 'ID_CARD_NO_ENROLLMENT');
+  }
 
   const s = await school();
   const name = `${student.first_name} ${student.last_name}`.trim();

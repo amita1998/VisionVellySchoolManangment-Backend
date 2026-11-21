@@ -443,6 +443,8 @@ export async function saveMarks({ scheduleId, userId, role, entries, submit, ip,
 }
 
 export async function unlockMarks({ scheduleId, adminId, reason, ip, userAgent }) {
+  const paper = await query('SELECT id FROM exam_schedules WHERE id = $1', [scheduleId]);
+  if (!paper.rows[0]) throw notFound('Paper not found.');
   const { rowCount } = await query(
     "UPDATE marks SET status = 'draft', submitted_at = NULL WHERE exam_schedule_id = $1 AND status = 'submitted'",
     [scheduleId],
@@ -461,49 +463,79 @@ export async function unlockMarks({ scheduleId, adminId, reason, ip, userAgent }
 }
 
 export async function overrideMark({ scheduleId, studentId, marksObtained, isAbsent, reason, adminId, ip, userAgent }) {
-  const schedule = await query('SELECT max_marks FROM exam_schedules WHERE id = $1', [scheduleId]);
-  if (!schedule.rows[0]) throw notFound('Paper not found.');
-  const maxMarks = Number(schedule.rows[0].max_marks);
-  if (!isAbsent && (marksObtained === null || marksObtained < 0 || marksObtained > maxMarks)) {
-    throw conflict(`Marks must be between 0 and ${maxMarks}.`, 'MARKS_OUT_OF_RANGE');
-  }
   if (!reason || reason.trim().length < 5) {
     throw conflict('An override needs a logged reason.', 'REASON_REQUIRED');
   }
+  if (!isAbsent && (!Number.isFinite(Number(marksObtained)) || Number(marksObtained) < 0)) {
+    throw conflict('Marks must be a number.', 'MARKS_INVALID');
+  }
 
-  const before = await query(
-    'SELECT id, marks_obtained, is_absent, status FROM marks WHERE exam_schedule_id = $1 AND student_id = $2',
-    [scheduleId, studentId],
-  );
+  const grades = await gradeTable();
 
-  const percentage = isAbsent ? null : (Number(marksObtained) / maxMarks) * 100;
-  const grade = percentage === null ? null : await gradeFor(percentage);
+  return withTransaction(async (client) => {
+    const schedule = await client.query(
+      `SELECT s.max_marks, s.class_id, ex.academic_year_id, ex.publish_status
+         FROM exam_schedules s JOIN examinations ex ON ex.id = s.exam_id
+        WHERE s.id = $1 FOR UPDATE`,
+      [scheduleId],
+    );
+    if (!schedule.rows[0]) throw notFound('Paper not found.');
+    const paper = schedule.rows[0];
+    if (paper.publish_status === 'published') {
+      throw conflict('The exam is published. Unpublish it before overriding a mark.', 'EXAM_PUBLISHED');
+    }
+    const maxMarks = Number(paper.max_marks);
+    if (!isAbsent && Number(marksObtained) > maxMarks) {
+      throw conflict(`Marks must be between 0 and ${maxMarks}.`, 'MARKS_OUT_OF_RANGE');
+    }
 
-  const { rows } = await query(
-    `INSERT INTO marks (exam_schedule_id, student_id, marks_obtained, is_absent, grade_id, status,
-       remarks, entered_by, submitted_at)
-     VALUES ($1, $2, $3, $4, $5, 'submitted', $6, $7, now())
-     ON CONFLICT (exam_schedule_id, student_id) DO UPDATE
-       SET marks_obtained = EXCLUDED.marks_obtained, is_absent = EXCLUDED.is_absent,
-           grade_id = EXCLUDED.grade_id, status = 'submitted', remarks = EXCLUDED.remarks,
-           entered_by = EXCLUDED.entered_by, submitted_at = now()
-     RETURNING id, marks_obtained, is_absent, grade_id`,
-    [scheduleId, studentId, isAbsent ? null : Number(marksObtained), Boolean(isAbsent), grade?.id ?? null, reason, adminId],
-  );
+    // The student must be on this paper's class roster for the exam's year.
+    const enrolled = await client.query(
+      `SELECT 1 FROM enrollments e
+         JOIN students st ON st.id = e.student_id
+        WHERE e.student_id = $1 AND e.class_id = $2 AND e.academic_year_id = $3
+          AND e.status = 'active' AND st.deleted_at IS NULL`,
+      [studentId, paper.class_id, paper.academic_year_id],
+    );
+    if (!enrolled.rows[0]) {
+      throw forbidden('That student is not in this paper\'s class.', 'STUDENT_NOT_IN_CLASS');
+    }
 
-  await audit({
-    actorUserId: adminId,
-    action: 'marks.overridden',
-    entityType: 'marks',
-    entityId: rows[0].id,
-    oldValues: before.rows[0] || null,
-    newValues: { marksObtained, isAbsent },
-    reason,
-    ip,
-    userAgent,
+    const before = await client.query(
+      'SELECT id, marks_obtained, is_absent, status FROM marks WHERE exam_schedule_id = $1 AND student_id = $2',
+      [scheduleId, studentId],
+    );
+
+    const percentage = isAbsent ? null : (Number(marksObtained) / maxMarks) * 100;
+    const grade = percentage === null ? null : gradeFrom(grades, percentage);
+
+    const { rows } = await client.query(
+      `INSERT INTO marks (exam_schedule_id, student_id, marks_obtained, is_absent, grade_id, status,
+         remarks, entered_by, submitted_at)
+       VALUES ($1, $2, $3, $4, $5, 'submitted', $6, $7, now())
+       ON CONFLICT (exam_schedule_id, student_id) DO UPDATE
+         SET marks_obtained = EXCLUDED.marks_obtained, is_absent = EXCLUDED.is_absent,
+             grade_id = EXCLUDED.grade_id, status = 'submitted', remarks = EXCLUDED.remarks,
+             entered_by = EXCLUDED.entered_by, submitted_at = now()
+       RETURNING id, marks_obtained, is_absent, grade_id`,
+      [scheduleId, studentId, isAbsent ? null : Number(marksObtained), Boolean(isAbsent), grade?.id ?? null, reason, adminId],
+    );
+
+    await audit({
+      client,
+      actorUserId: adminId,
+      action: 'marks.overridden',
+      entityType: 'marks',
+      entityId: rows[0].id,
+      oldValues: before.rows[0] || null,
+      newValues: { marksObtained, isAbsent },
+      reason,
+      ip,
+      userAgent,
+    });
+
+    return rows[0];
   });
-
-  return rows[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -584,8 +616,12 @@ export async function reportCard({ studentId, examId }) {
         ORDER BY total DESC`,
       [examId, enrollment.rows[0].class_id],
     );
-    const position = totals.rows.findIndex((row) => row.student_id === studentId);
-    rank = position >= 0 ? { position: position + 1, of: totals.rows.length } : null;
+      const index = totals.rows.findIndex((row) => row.student_id === studentId);
+    if (index >= 0) {
+      const total = Number(totals.rows[index].total);
+      const ahead = totals.rows.filter((row) => Number(row.total) > total).length;
+      rank = { position: ahead + 1, of: totals.rows.length };
+    }
   }
 
   return {
