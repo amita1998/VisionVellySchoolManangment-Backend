@@ -112,7 +112,18 @@ export async function healthCheck() {
   const { rows } = await pool.query(
     "select current_database() as database, now() at time zone 'Asia/Kolkata' as server_time",
   );
-  return rows[0];
+  /**
+   * The host is echoed back so an operator can see WHICH database the running deployment is
+   * actually talking to — two Neon projects look identical from the database name alone.
+   * Only the hostname leaves the process; the credentials never do.
+   */
+  let host = null;
+  try {
+    host = new URL(process.env.DATABASE_URL).hostname;
+  } catch {
+    host = null;
+  }
+  return { ...rows[0], host };
 }
 
 export default pool;
