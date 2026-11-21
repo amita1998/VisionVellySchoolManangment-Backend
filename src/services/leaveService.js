@@ -3,6 +3,7 @@ import { AppError, conflict, forbidden, notFound } from '../utils/errors.js';
 import { pagedMeta } from '../utils/request.js';
 import { audit } from './auditService.js';
 import { currentYear } from './academicsService.js';
+import { notify } from './commsService.js';
 
 /**
  * Leave management.
@@ -92,7 +93,8 @@ export async function listRequests(req) {
   const filter = where.join(' AND ');
   const [rows, total] = await Promise.all([
     query(
-      `SELECT lr.id, lr.from_date, lr.to_date, lr.days, lr.reason, lr.status,
+      `SELECT lr.id, lr.from_date, lr.to_date, lr.days::float8 AS days, lr.reason, lr.status,
+              lr.duration_type, lr.hours,
               to_char(lr.from_date, 'DD-MM-YYYY') AS from_label,
               to_char(lr.to_date, 'DD-MM-YYYY') AS to_label,
               lt.name AS leave_type, lt.code AS leave_code,
@@ -250,6 +252,100 @@ async function resolveMember(actor, payload, client) {
   throw forbidden('You cannot apply for leave for this teacher.', 'LEAVE_FORBIDDEN');
 }
 
+/**
+ * Leave touches two sides, so both get a notification:
+ *   * a new request goes to every admin (and, for a student, to the class teacher who decides)
+ *   * a decision goes back to whoever filed the request
+ * Rows are written inside the caller's transaction: a notification that says "approved" can
+ * never survive a rolled-back approval.
+ */
+async function adminUserIds(client) {
+  const { rows } = await client.query(
+    `SELECT u.id FROM users u JOIN roles r ON r.id = u.role_id
+      WHERE r.code = 'admin' AND u.is_active AND u.deleted_at IS NULL`,
+  );
+  return rows.map((row) => row.id);
+}
+
+async function memberLabel(client, { studentId, teacherId }) {
+  if (studentId) {
+    const { rows } = await client.query(
+      `SELECT coalesce(s.admission_id, 'Student') || ' — ' || s.first_name || ' ' || s.last_name AS label
+         FROM students s WHERE s.id = $1`,
+      [studentId],
+    );
+    return rows[0]?.label ?? 'A student';
+  }
+  const { rows } = await client.query(
+    `SELECT t.first_name || ' ' || t.last_name AS label FROM teachers t WHERE t.id = $1`,
+    [teacherId],
+  );
+  return rows[0]?.label ?? 'A teacher';
+}
+
+/** Human length of the absence: "3 days", "half day", "3 hours". */
+function lengthLabel({ days, durationType, hours }) {
+  if (durationType === 'hourly') return `${hours} hour${Number(hours) === 1 ? '' : 's'}`;
+  if (durationType === 'half_day') return 'half day';
+  const n = Number(days);
+  return `${n} day${n === 1 ? '' : 's'}`;
+}
+
+/** DD-MM-YYYY from a date column or an ISO string. */
+function dayLabel(value) {
+  if (!value) return '';
+  if (value instanceof Date) {
+    const [y, m, d] = [value.getFullYear(), value.getMonth() + 1, value.getDate()];
+    return `${String(d).padStart(2, '0')}-${String(m).padStart(2, '0')}-${y}`;
+  }
+  const [y, m, d] = String(value).slice(0, 10).split('-');
+  return `${d}-${m}-${y}`;
+}
+
+async function notifyAdminsOfRequest(client, { requestId, member, leaveType, days, durationType, hours, from, to }) {
+  const label = await memberLabel(client, member);
+  const length = lengthLabel({ days, durationType, hours });
+  const when = dayLabel(from) === dayLabel(to) ? dayLabel(from) : `${dayLabel(from)} → ${dayLabel(to)}`;
+  for (const userId of await adminUserIds(client)) {
+    await notify({
+      client,
+      userId,
+      type: 'leave',
+      title: 'New leave request',
+      body: `${label} requested ${leaveType.name} (${length}, ${when}).`,
+      link: '/admin/leave',
+      entityType: 'leave_request',
+      entityId: requestId,
+    });
+  }
+}
+
+/** The applicant's own inbox: teacher, student or the parent who filed it. */
+async function notifyRequesterOfDecision(client, request, { decision, note, leaveTypeName }) {
+  if (!request.requested_by) return;
+  const { rows } = await client.query(
+    `SELECT r.code AS role FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = $1`,
+    [request.requested_by],
+  );
+  const role = rows[0]?.role;
+  const link =
+    role === 'teacher' ? '/teacher/leave'
+      : role === 'student' ? '/student/leave'
+        : role === 'parent' ? '/parent/leave'
+          : '/admin/leave';
+  const verdict = decision === 'approved' ? 'approved' : 'rejected';
+  await notify({
+    client,
+    userId: request.requested_by,
+    type: 'leave',
+    title: `Leave ${verdict}`,
+    body: `Your ${leaveTypeName} request (${dayLabel(request.from_date)}${dayLabel(request.from_date) === dayLabel(request.to_date) ? '' : ` → ${dayLabel(request.to_date)}`}) was ${verdict}.${note ? ` Note: ${note}` : ''}`,
+    link,
+    entityType: 'leave_request',
+    entityId: request.id,
+  });
+}
+
 export async function apply(actor, payload) {
   return withTransaction(async (client) => {
     const year = await currentYear(client);
@@ -268,13 +364,35 @@ export async function apply(actor, payload) {
       throw badRequest(`${leaveType.name} does not apply to this member.`, 'LEAVE_TYPE_NOT_APPLICABLE');
     }
 
-    // Inclusive day count from the calendar dates as sent.
-    const daysRow = await client.query('SELECT ($2::date - $1::date) + 1 AS days', [
-      payload.fromDate,
-      payload.toDate,
-    ]);
-    const days = daysRow.rows[0].days;
-    if (days <= 0) throw badRequest('The leave must end on or after it starts.', 'LEAVE_RANGE');
+    /**
+     * Duration decides what the leave costs against the quota:
+     *   full_day — every calendar day in the range
+     *   half_day — 0.5
+     *   hourly   — hours / 8, rounded to two decimals
+     * A short leave cannot span dates (the database enforces this too).
+     */
+    const duration = payload.durationType ?? 'full_day';
+    if (duration !== 'full_day' && payload.fromDate !== payload.toDate) {
+      throw badRequest('A half-day or hourly leave must start and end on the same date.', 'LEAVE_SHORT_SINGLE_DAY');
+    }
+
+    let days;
+    if (duration === 'full_day') {
+      const daysRow = await client.query('SELECT ($2::date - $1::date) + 1 AS days', [
+        payload.fromDate,
+        payload.toDate,
+      ]);
+      days = daysRow.rows[0].days;
+      if (days <= 0) throw badRequest('The leave must end on or after it starts.', 'LEAVE_RANGE');
+    } else if (duration === 'half_day') {
+      days = 0.5;
+    } else {
+      if (!(payload.hours >= 1 && payload.hours <= 8)) {
+        throw badRequest('An hourly leave needs between 1 and 8 hours.', 'LEAVE_HOURS');
+      }
+      days = Math.round((payload.hours / 8) * 100) / 100;
+    }
+    const hours = duration === 'hourly' ? payload.hours : null;
 
     const column = isStudent ? 'student_id' : 'teacher_id';
     const memberId = isStudent ? member.studentId : member.teacherId;
@@ -292,12 +410,12 @@ export async function apply(actor, payload) {
 
     if (leaveType.annual_quota !== null) {
       const used = await client.query(
-        `SELECT coalesce(sum(days), 0)::int AS used FROM leave_requests
+        `SELECT coalesce(sum(days), 0)::numeric AS used FROM leave_requests
           WHERE ${column} = $1 AND leave_type_id = $2 AND academic_year_id = $3
             AND status IN ('approved', 'pending')`,
         [memberId, leaveType.id, year.id],
       );
-      if (used.rows[0].used + days > leaveType.annual_quota) {
+      if (Number(used.rows[0].used) + Number(days) > leaveType.annual_quota) {
         throw conflict(
           `${leaveType.name}: ${used.rows[0].used} of ${leaveType.annual_quota} days already used or pending.`,
           'LEAVE_QUOTA_EXCEEDED',
@@ -307,10 +425,12 @@ export async function apply(actor, payload) {
 
     const { rows } = await client.query(
       `INSERT INTO leave_requests
-         (academic_year_id, leave_type_id, student_id, teacher_id, from_date, to_date, days, reason, requested_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (academic_year_id, leave_type_id, student_id, teacher_id, from_date, to_date, days,
+          duration_type, hours, reason, requested_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
-      [year.id, leaveType.id, member.studentId, member.teacherId, payload.fromDate, payload.toDate, days, payload.reason, actor.id],
+      [year.id, leaveType.id, member.studentId, member.teacherId, payload.fromDate, payload.toDate, days,
+        duration, hours, payload.reason, actor.id],
     );
     await audit({
       client,
@@ -319,7 +439,18 @@ export async function apply(actor, payload) {
       action: 'leave.requested',
       entityType: 'leave_request',
       entityId: rows[0].id,
-      newValues: { from: payload.fromDate, to: payload.toDate, days },
+      newValues: { from: payload.fromDate, to: payload.toDate, days, duration, hours },
+    });
+
+    await notifyAdminsOfRequest(client, {
+      requestId: rows[0].id,
+      member: { studentId: member.studentId, teacherId: member.teacherId },
+      leaveType,
+      days: rows[0].days,
+      durationType: rows[0].duration_type,
+      hours: rows[0].hours,
+      from: payload.fromDate,
+      to: payload.toDate,
     });
     return rows[0];
   });
@@ -389,6 +520,13 @@ export async function decide(actor, requestId, { decision, note = null }) {
       entityType: 'leave_request',
       entityId: requestId,
       newValues: { decision, note, attendance_rows: marked },
+    });
+
+    const typeRow = await client.query('SELECT name FROM leave_types WHERE id = $1', [request.leave_type_id]);
+    await notifyRequesterOfDecision(client, request, {
+      decision,
+      note,
+      leaveTypeName: typeRow.rows[0]?.name ?? 'leave',
     });
     return { ...rows[0], attendance_marked: marked };
   });

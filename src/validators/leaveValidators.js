@@ -11,7 +11,20 @@ export const leaveRequestSchema = z
     teacherId: ID.optional(),
     fromDate: DATE,
     toDate: DATE,
+    /** full_day (default) | half_day | hourly — how much of the day the absence costs. */
+    durationType: z.enum(['full_day', 'half_day', 'hourly']).optional(),
+    hours: z.coerce.number().int().min(1).max(8).optional(),
     reason: z.string().trim().min(3, 'Say why the leave is needed').max(500),
+  })
+  .refine((value) => (value.durationType === 'hourly' ? Boolean(value.hours) : true), {
+    message: 'Enter how many hours the leave covers',
+    path: ['hours'],
+  })
+  .refine((value) => (value.durationType && value.durationType !== 'full_day'
+    ? value.fromDate === value.toDate
+    : true), {
+    message: 'A half-day or hourly leave must be a single date',
+    path: ['toDate'],
   })
   // A student/teacher may omit both and apply for themselves; a parent may omit it for a single child.
   .refine((value) => !(value.studentId && value.teacherId), {

@@ -80,6 +80,82 @@ after(async () => {
   await pool.end();
 });
 
+describe('short leave and notifications', () => {
+  it('stores a half day as 0.5 and refuses a short leave that spans dates', async () => {
+    const day = await daysAgo(-3); // a few days in the future
+    const ok = await call('POST', '/api/leave/requests', {
+      token: tokens.student,
+      body: {
+        leaveTypeId: types.short.id,
+        studentId: ids.studentId,
+        durationType: 'half_day',
+        fromDate: day,
+        toDate: day,
+        reason: 'Afternoon hospital visit',
+      },
+    });
+    assert.equal(ok.status, 201, JSON.stringify(ok.body));
+    assert.equal(Number(ok.body.data.request.days), 0.5);
+    assert.equal(ok.body.data.request.duration_type, 'half_day');
+
+    const bad = await call('POST', '/api/leave/requests', {
+      token: tokens.student,
+      body: {
+        leaveTypeId: types.short.id,
+        studentId: ids.studentId,
+        durationType: 'half_day',
+        fromDate: await daysAgo(-6),
+        toDate: await daysAgo(-5),
+        reason: 'Spans two days',
+      },
+    });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error.code, 'VALIDATION_ERROR');
+  });
+
+  it('counts an hourly leave as hours/8', async () => {
+    const day = await daysAgo(-8);
+    const res = await call('POST', '/api/leave/requests', {
+      token: tokens.teacher,
+      body: {
+        leaveTypeId: types.short.id,
+        durationType: 'hourly',
+        hours: 2,
+        fromDate: day,
+        toDate: day,
+        reason: 'Bank work',
+      },
+    });
+    assert.equal(res.status, 201, JSON.stringify(res.body));
+    assert.equal(Number(res.body.data.request.days), 0.25);
+    assert.equal(res.body.data.request.hours, 2);
+    ids.shortRequest = res.body.data.request.id;
+  });
+
+  it('notifies the admin of a new request and the teacher of the decision', async () => {
+    const before = await pool.query('SELECT count(*)::int AS n FROM notifications');
+    const decided = await call('POST', `/api/leave/requests/${ids.shortRequest}/decide`, {
+      token: tokens.admin,
+      body: { decision: 'approved', note: 'Fine' },
+    });
+    assert.equal(decided.status, 200, JSON.stringify(decided.body));
+
+    const { rows } = await pool.query(
+      `SELECT type, title, body, link FROM notifications ORDER BY id DESC LIMIT 2`,
+    );
+    assert.equal(rows.length, 2);
+    assert.ok(rows.some((row) => row.link === '/admin/leave'), 'admin should be told about the request');
+    const decision = rows.find((row) => row.link === '/teacher/leave');
+    assert.ok(decision, 'the applicant should be told about the decision');
+    assert.equal(decision.title, 'Leave approved');
+    assert.match(decision.body, /was approved/);
+    // the request message carries the human length, not "0.25 days"
+    const request = rows.find((row) => row.link === '/admin/leave');
+    assert.match(request.body, /2 hours/);
+    assert.ok((await pool.query('SELECT count(*)::int AS n FROM notifications')).rows[0].n > before.rows[0].n);
+  });
+});
+
 describe('applying', () => {
   it('lets a student apply and counts the days inclusively', async () => {
     const from = await daysAgo(2);
@@ -89,7 +165,7 @@ describe('applying', () => {
       body: { leaveTypeId: types.sick.id, studentId: ids.studentId, fromDate: from, toDate: to, reason: 'Fever' },
     });
     assert.equal(res.status, 201);
-    assert.equal(res.body.data.request.days, 2);
+    assert.equal(Number(res.body.data.request.days), 2); // NUMERIC arrives as a string
     assert.equal(res.body.data.request.status, 'pending');
     ids.sickRequest = res.body.data.request.id;
   });
