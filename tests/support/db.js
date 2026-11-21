@@ -7,6 +7,13 @@ import { pool } from '../../src/config/db.js';
  */
 const TRUNCATE = [
   'audit_logs',
+  'chat_reads',
+  'chat_messages',
+  'chat_threads',
+  'syllabus_portions',
+  'syllabus_chapters',
+  'ptm_bookings',
+  'ptm_slots',
   'leave_requests',
   'library_issues',
   'library_books',

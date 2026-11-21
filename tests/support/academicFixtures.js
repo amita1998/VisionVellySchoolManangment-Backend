@@ -153,6 +153,8 @@ export async function seedAcademicFixtures() {
      VALUES ($1, $2, $3, '2026-11-02', '09:00', '10:00', 100) RETURNING id`,
     [exam.rows[0].id, ids.classId, ids.subjectId],
   );
+  ids.scheduleId = schedule.rows[0].id;
+
   // grades are reference data created by the seed script, not by a migration
   const grade = await pool.query(
     `INSERT INTO grades (code, min_percent, max_percent, grade_point, sort_order) VALUES
