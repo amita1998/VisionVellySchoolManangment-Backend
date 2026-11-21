@@ -25,6 +25,11 @@ export async function audit(entry) {
   const runner = client ? client.query.bind(client) : query;
 
   try {
+    // Inside a transaction a failed INSERT aborts the WHOLE transaction (Postgres marks it
+    // 'current transaction is aborted'), so the caller's COMMIT would silently write nothing while
+    // the API still answered 200. A savepoint keeps the business write alive if only the audit
+    // insert fails.
+    if (client) await client.query('SAVEPOINT audit_sp');
     await runner(
       `INSERT INTO audit_logs (actor_user_id, actor_role, action, entity_type, entity_id,
          old_values, new_values, reason, ip, user_agent)
@@ -42,7 +47,16 @@ export async function audit(entry) {
         userAgent ? String(userAgent).slice(0, 400) : null,
       ],
     );
+    if (client) await client.query('RELEASE SAVEPOINT audit_sp');
   } catch (error) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK TO SAVEPOINT audit_sp');
+      } catch (rollbackError) {
+        // the transaction was already aborted by something else; nothing more we can do here
+        console.error('[audit] could not roll back to the audit savepoint', rollbackError.message);
+      }
+    }
     console.error('[audit] failed to write audit entry', { action, entityType, entityId, error });
   }
 }

@@ -476,25 +476,37 @@ export async function listCorrections(req) {
 }
 
 export async function reviewCorrection({ correctionId, adminId, decision, comment, ip, userAgent }) {
-  const corrections = await query(
-    `SELECT c.*, a.status AS current_status, a.section_id
-       FROM attendance_corrections c JOIN attendance a ON a.id = c.attendance_id
-      WHERE c.id = $1`,
-    [correctionId],
-  );
-  if (!corrections.rows[0]) throw notFound('Correction request not found.');
-  const correction = corrections.rows[0];
-  if (correction.status !== 'pending') {
-    throw conflict('This request has already been reviewed.', 'ALREADY_REVIEWED');
-  }
+  return withTransaction(async (client) => {
+    // FOR UPDATE: two admins clicking approve and reject at the same time used to both succeed.
+    const corrections = await client.query(
+      `SELECT c.*, a.status AS current_status
+         FROM attendance_corrections c
+         JOIN attendance a ON a.id = c.attendance_id
+        WHERE c.id = $1 FOR UPDATE`,
+      [correctionId],
+    );
+    const correction = corrections.rows[0];
+    if (!correction) throw notFound('Correction request not found.');
+    if (correction.status !== 'pending') {
+      throw conflict('This request has already been reviewed.', 'ALREADY_REVIEWED');
+    }
+    // The request describes a change from a specific value; if attendance moved underneath it,
+    // approving would silently overwrite the newer marking.
+    if (decision === 'approved' && correction.current_status !== correction.old_status) {
+      throw conflict(
+        'The attendance changed after this request was raised. Ask for a fresh correction.',
+        'ATTENDANCE_CHANGED',
+      );
+    }
 
-  await withTransaction(async (client) => {
-    await client.query(
+    const updated = await client.query(
       `UPDATE attendance_corrections
           SET status = $2, reviewed_by = $3, reviewed_at = now(), review_comment = $4
-        WHERE id = $1`,
+        WHERE id = $1 AND status = 'pending'
+        RETURNING id`,
       [correctionId, decision, adminId, comment ?? null],
     );
+    if (updated.rowCount === 0) throw conflict('This request has already been reviewed.', 'ALREADY_REVIEWED');
 
     if (decision === 'approved') {
       await client.query(
@@ -515,9 +527,9 @@ export async function reviewCorrection({ correctionId, adminId, decision, commen
       ip,
       userAgent,
     });
-  });
 
-  return { correctionId, status: decision };
+    return { correctionId, status: decision };
+  });
 }
 
 export default {

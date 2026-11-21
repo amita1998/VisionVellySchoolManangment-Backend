@@ -35,13 +35,26 @@ export const scheduleSchema = z
 
 export const publishSchema = z.object({ publish: z.boolean() });
 
+/**
+ * A mark is a finite number or nothing. `Number('abc')` is NaN, and both `NaN < 0` and `NaN > max`
+ * are false — a NaN used to slip through validation into a NUMERIC column and turn a whole class's
+ * totals into NaN.
+ */
+const MARK_VALUE = z
+  .union([z.number(), z.string(), z.null()])
+  .optional()
+  .refine(
+    (value) => value === null || value === undefined || value === '' || Number.isFinite(Number(value)),
+    { message: 'Enter a number' },
+  );
+
 export const marksSchema = z.object({
   submit: z.boolean().optional().default(false),
   entries: z
     .array(
       z.object({
         studentId: ID,
-        marksObtained: z.union([z.number(), z.string(), z.null()]).optional(),
+        marksObtained: MARK_VALUE,
         isAbsent: z.boolean().optional(),
         remarks: z.string().trim().max(200).optional().nullable(),
       }),
@@ -56,7 +69,7 @@ export const unlockSchema = z.object({
 
 export const overrideSchema = z.object({
   studentId: ID,
-  marksObtained: z.union([z.number(), z.string(), z.null()]).optional(),
+  marksObtained: MARK_VALUE,
   isAbsent: z.boolean().optional(),
   reason: z.string().trim().min(5, 'A reason is required').max(300),
 });

@@ -110,10 +110,9 @@ export const teacherSchema = z.object({
 });
 
 // The email is the teacher's login name, so it is editable — the service renames the account.
-export const updateTeacherSchema = teacherSchema
-  .omit({ assignments: true })
-  .partial()
-  .extend({ status: z.enum(['active', 'on_leave', 'resigned']).optional() });
+// No `status` here on purpose: a plain edit must not be able to resign a class teacher, which
+// would skip the "still a class teacher" guard that /teachers/:id/status enforces.
+export const updateTeacherSchema = teacherSchema.omit({ assignments: true }).partial();
 
 export const teacherStatusSchema = z.object({
   status: z.enum(['active', 'on_leave', 'resigned']),

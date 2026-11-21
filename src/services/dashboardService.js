@@ -75,7 +75,7 @@ async function noticesFor({ role, classIds = [], userId = null, limit = 5 }) {
   return rows;
 }
 
-async function calendarFor({ classIds = [], limit = 200 }) {
+async function calendarFor({ classIds = [], role = 'admin', limit = 200 }) {
   const now = await today();
   const { rows } = await query(
     `WITH month_bounds AS (
@@ -94,7 +94,10 @@ async function calendarFor({ classIds = [], limit = 200 }) {
                 SELECT 1 FROM event_classes ec
                  WHERE ec.event_id = e.id AND ec.class_id = ANY($3::int[])
               ))
-           OR e.audience IN ('teachers', 'students', 'parents')
+           OR ($5 = 'admin')
+           OR ($5 = 'teacher' AND e.audience = 'teachers')
+           OR ($5 = 'student' AND e.audience = 'students')
+           OR ($5 = 'parent' AND e.audience = 'parents')
         )
      UNION ALL
      SELECT es.exam_date AS date, ex.name || ' · ' || s.name AS title, 'exam' AS kind, 'Examination' AS category
@@ -107,7 +110,7 @@ async function calendarFor({ classIds = [], limit = 200 }) {
         AND es.exam_date BETWEEN mb.first_day AND mb.last_day
      ORDER BY date, title
      LIMIT $4`,
-    [now.year, now.month, classIds, limit],
+    [now.year, now.month, classIds, limit, role],
   );
   const monthLabel = new Date(Date.UTC(now.year, now.month - 1, 1)).toLocaleDateString('en-GB', {
     month: 'long',
@@ -258,7 +261,7 @@ export async function adminDashboard(user) {
     today: now,
     shell: {
       user: shellUser(user),
-      calendar: await calendarFor({ classIds: [] }),
+      calendar: await calendarFor({ classIds: [], role: 'admin' }),
       notices,
       unreadNotifications: await unreadNotifications(user.id),
       reminders: buildAdminReminders(attendance, notices),
@@ -315,7 +318,7 @@ export async function teacherDashboard(user) {
       today: now,
       shell: {
         user: shellUser(user),
-        calendar: await calendarFor({ classIds: [] }),
+        calendar: await calendarFor({ classIds: [], role: 'teacher' }),
         notices: await noticesFor({ role: 'teacher', classIds: [], userId: user.id, limit: 4 }),
         unreadNotifications: await unreadNotifications(user.id),
         reminders: [{ text: 'No teacher record linked to this login', meta: 'Ask the admin office to link your profile', tone: 'coral' }],
@@ -409,7 +412,7 @@ export async function teacherDashboard(user) {
     today: now,
     shell: {
       user: shellUser(user, `${teacher.first_name} ${teacher.last_name}`),
-      calendar: await calendarFor({ classIds: myClassIds }),
+      calendar: await calendarFor({ classIds: myClassIds, role: 'teacher' }),
       notices,
       unreadNotifications: await unreadNotifications(user.id),
       reminders: buildTeacherReminders(schedule.rows, isClassTeacher),
@@ -546,7 +549,7 @@ export async function studentDashboard(user) {
       today: now,
       shell: {
         user: shellUser(user),
-        calendar: await calendarFor({ classIds: [] }),
+        calendar: await calendarFor({ classIds: [], role: 'student' }),
         notices: await noticesFor({ role: 'student', classIds: [], userId: user.id, limit: 4 }),
         unreadNotifications: await unreadNotifications(user.id),
         reminders: [{ text: 'No student record linked to this login', meta: 'Contact the school office', tone: 'coral' }],
@@ -617,7 +620,7 @@ export async function studentDashboard(user) {
     today: now,
     shell: {
       user: shellUser(user, `${row.first_name} ${row.last_name}`),
-      calendar: await calendarFor({ classIds }),
+      calendar: await calendarFor({ classIds, role: 'student' }),
       notices,
       unreadNotifications: await unreadNotifications(user.id),
       reminders: buildStudentReminders(snapshot, exams.rows),
@@ -691,7 +694,7 @@ function buildStudentReminders(snapshot, exams) {
 async function childrenOf(userId, yearId) {
   const { rows } = await query(
     `SELECT st.id, st.admission_id, st.first_name, st.last_name, st.photo_path,
-            c.name AS class_name, s.name AS section_name
+            c.name AS class_name, s.name AS section_name, (e.class_id IS NOT NULL) AS enrolled
        FROM parents p
        JOIN student_parents sp ON sp.parent_id = p.id
        JOIN students st ON st.id = sp.student_id AND st.deleted_at IS NULL
@@ -735,7 +738,7 @@ export async function parentDashboard(user, requestedChildId) {
       today: now,
       shell: {
         user: shellUser(user),
-        calendar: await calendarFor({ classIds: [] }),
+        calendar: await calendarFor({ classIds: [], role: 'parent' }),
         notices: await noticesFor({ role: 'parent', classIds: [], userId: user.id, limit: 4 }),
         unreadNotifications: await unreadNotifications(user.id),
         reminders: [{ text: 'No children linked to this account', meta: 'Ask the school office to link your child', tone: 'coral' }],
@@ -748,11 +751,40 @@ export async function parentDashboard(user, requestedChildId) {
   }
 
   // IDOR guard: a parent may only open a child that is linked to their account.
-  let child = children[0];
+  let child = null;
   if (requestedChildId) {
     const match = children.find((row) => row.id === Number(requestedChildId));
     if (!match) throw forbidden('You can only view your own children.', 'CHILD_FORBIDDEN');
     child = match;
+  } else {
+    // The default child must be one who is actually on the rolls this year. Picking children[0]
+    // made the whole dashboard a 404 for a family whose eldest had graduated.
+    child = children.find((row) => row.enrolled) ?? null;
+  }
+
+  if (!child) {
+    return {
+      role: 'parent',
+      today: now,
+      shell: {
+        user: shellUser(user),
+        calendar: await calendarFor({ classIds: [], role: 'parent' }),
+        notices: await noticesFor({ role: 'parent', classIds: [], userId: user.id, limit: 4 }),
+        unreadNotifications: await unreadNotifications(user.id),
+        reminders: [{ text: 'No child is enrolled this year', meta: 'The office can place your child in a class', tone: 'coral' }],
+      },
+      cards: [],
+      children: children.map((row) => ({
+        id: row.id,
+        name: `${row.first_name} ${row.last_name}`,
+        admissionId: row.admission_id,
+        className: row.class_name,
+        section: row.section_name,
+        enrolled: row.enrolled,
+      })),
+      child: null,
+      missingProfile: true,
+    };
   }
 
   const enrollment = await enrollmentFor(child.id, yearId);
@@ -795,7 +827,7 @@ export async function parentDashboard(user, requestedChildId) {
     today: now,
     shell: {
       user: shellUser(user, parentName),
-      calendar: await calendarFor({ classIds }),
+      calendar: await calendarFor({ classIds, role: 'parent' }),
       notices,
       unreadNotifications: await unreadNotifications(user.id),
       reminders: buildParentReminders(fees, exams.rows),

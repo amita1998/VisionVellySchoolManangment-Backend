@@ -387,11 +387,19 @@ describe('duplicates, guardian logins and teacher editing', () => {
 
     const guardian = res.body.data.guardians.find((g) => g.username === 'login.guardian@vvs.test');
     assert.ok(guardian, 'the admission slip lists the guardian login');
+    assert.ok(guardian.temporaryPassword, 'every account gets its own temporary password');
 
-    // The same temporary password opens the guardian's account.
-    const signIn = await login('parent', 'login.guardian@vvs.test', res.body.data.account.temporaryPassword);
+    // The guardian's own password opens the guardian account…
+    const signIn = await login('parent', 'login.guardian@vvs.test', guardian.temporaryPassword);
     assert.equal(signIn.body.success, true);
     assert.equal(signIn.body.data.user.role, 'parent');
+
+    // …and the student's password does NOT (a shared password let a parent sign in as the child).
+    assert.notEqual(guardian.temporaryPassword, res.body.data.account.temporaryPassword);
+    const crossed = await call('POST', '/api/auth/login', {
+      body: { identifier: 'login.guardian@vvs.test', password: res.body.data.account.temporaryPassword },
+    });
+    assert.equal(crossed.status, 401);
   });
 
   it('issues a fresh temporary password for a guardian', async () => {

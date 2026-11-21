@@ -12,15 +12,25 @@ import { currentYear } from './academicsService.js';
  *  - the grade comes from the configurable grade scale (A+ .. E).
  */
 
-async function gradeFor(percentage, client = null) {
+/** The whole grade scale, highest band first. Loaded once per request (BE-50). */
+async function gradeTable(client = null) {
   const runner = client ? client.query.bind(client) : query;
   const { rows } = await runner(
-    `SELECT id, code FROM grades
-      WHERE $1 >= min_percent AND $1 <= max_percent
-      ORDER BY sort_order LIMIT 1`,
-    [percentage],
+    'SELECT id, code, min_percent FROM grades ORDER BY min_percent DESC',
   );
-  return rows[0] || null;
+  return rows;
+}
+
+/**
+ * Highest band whose minimum is reached. Matching on min_percent alone removes the gaps between
+ * bands (80–89.99 followed by 90–100 left 89.995 ungraded) and never depends on a query per student.
+ */
+function gradeFrom(table, percentage) {
+  return table.find((row) => percentage >= Number(row.min_percent)) ?? null;
+}
+
+async function gradeFor(percentage, client = null) {
+  return gradeFrom(await gradeTable(client), percentage);
 }
 
 async function assertTeacherPaper(userId, scheduleId, yearId, client = null) {
@@ -186,40 +196,80 @@ export async function deleteSchedule({ examId, scheduleId, actor, ip, userAgent 
 }
 
 export async function setPublished({ examId, publish, actor, ip, userAgent }) {
-  const exam = await getExam(examId);
-  if (publish) {
-    if (exam.schedules.length === 0) {
-      throw conflict('Add at least one paper before publishing.', 'NO_SCHEDULES');
-    }
-    const pending = exam.schedules.filter((schedule) => schedule.marks_entered < schedule.student_count);
-    if (pending.length > 0) {
-      throw conflict(
-        `Marks are still incomplete for ${pending.length} paper(s).`,
-        'MARKS_INCOMPLETE',
+  return withTransaction(async (client) => {
+    // Lock the exam so two admins cannot publish/unpublish against a shifting schedule.
+    const locked = await client.query(
+      'SELECT id, academic_year_id, publish_status FROM examinations WHERE id = $1 AND deleted_at IS NULL FOR UPDATE',
+      [examId],
+    );
+    if (!locked.rows[0]) throw notFound('Exam not found.');
+    const exam = locked.rows[0];
+
+    if (publish) {
+      const schedules = await client.query('SELECT id, class_id FROM exam_schedules WHERE exam_id = $1', [examId]);
+      if (schedules.rows.length === 0) {
+        throw conflict('Add at least one paper before publishing.', 'NO_SCHEDULES');
+      }
+
+      // The publish gate counts SUBMITTED marks against the real roster (active enrollment in the
+      // exam's own year, living students still on the rolls). Counting drafts or deleted students
+      // is what used to publish half-entered report cards.
+      const required = await client.query(
+        `SELECT e.class_id, count(*)::int AS required
+           FROM enrollments e
+           JOIN students st ON st.id = e.student_id
+          WHERE e.academic_year_id = $1 AND e.status = 'active'
+            AND st.deleted_at IS NULL
+            AND st.status NOT IN ('withdrawn', 'transferred', 'graduated')
+          GROUP BY e.class_id`,
+        [exam.academic_year_id],
       );
+      const requiredByClass = new Map(required.rows.map((row) => [row.class_id, row.required]));
+
+      const submitted = await client.query(
+        `SELECT s.id AS schedule_id, count(DISTINCT m.student_id)::int AS submitted
+           FROM exam_schedules s
+           LEFT JOIN marks m ON m.exam_schedule_id = s.id AND m.status = 'submitted'
+          WHERE s.exam_id = $1
+          GROUP BY s.id`,
+        [examId],
+      );
+
+      const pending = submitted.rows.filter(
+        (row) => row.submitted < (requiredByClass.get(
+          schedules.rows.find((schedule) => schedule.id === row.schedule_id)?.class_id,
+        ) ?? 0),
+      );
+      if (pending.length > 0) {
+        throw conflict(
+          `Marks are still incomplete for ${pending.length} paper(s). Every enrolled student needs a submitted mark.`,
+          'MARKS_INCOMPLETE',
+        );
+      }
     }
-  }
 
-  const { rows } = await query(
-    `UPDATE examinations
-        SET publish_status = $2::exam_publish_status,
-            published_at = CASE WHEN $2::text = 'published' THEN now() ELSE NULL END,
-            published_by = CASE WHEN $2::text = 'published' THEN $3::int ELSE NULL END
-      WHERE id = $1 AND deleted_at IS NULL
-      RETURNING id, publish_status, published_at`,
-    [examId, publish ? 'published' : 'draft', actor?.id ?? null],
-  );
+    const { rows } = await client.query(
+      `UPDATE examinations
+          SET publish_status = $2::exam_publish_status,
+              published_at = CASE WHEN $2::text = 'published' THEN now() ELSE NULL END,
+              published_by = CASE WHEN $2::text = 'published' THEN $3::int ELSE NULL END
+        WHERE id = $1
+        RETURNING id, publish_status, published_at`,
+      [examId, publish ? 'published' : 'draft', actor?.id ?? null],
+    );
 
-  await audit({
-    actorUserId: actor?.id,
-    actorRole: actor?.role,
-    action: publish ? 'exam.published' : 'exam.unpublished',
-    entityType: 'examinations',
-    entityId: examId,
-    ip,
-    userAgent,
+    await audit({
+      client,
+      actorUserId: actor?.id,
+      actorRole: actor?.role,
+      action: publish ? 'exam.published' : 'exam.unpublished',
+      entityType: 'examinations',
+      entityId: examId,
+      ip,
+      userAgent,
+    });
+    return rows[0];
   });
-  return rows[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -227,12 +277,8 @@ export async function setPublished({ examId, publish, actor, ip, userAgent }) {
 // ---------------------------------------------------------------------------
 
 export async function marksSheet({ scheduleId, userId, role }) {
-  const year = await currentYear();
-  const yearId = year?.id ?? 0;
-  if (role !== 'admin') await assertTeacherPaper(userId, scheduleId, yearId);
-
   const schedule = await query(
-    `SELECT s.id, s.max_marks, s.exam_id, s.class_id, s.subject_id,
+    `SELECT s.id, s.max_marks, s.exam_id, s.class_id, s.subject_id, ex.academic_year_id,
             to_char(s.exam_date, 'DD-MM-YYYY') AS date_label,
             c.name AS class_name, sub.name AS subject_name,
             ex.name AS exam_name, ex.publish_status
@@ -244,93 +290,114 @@ export async function marksSheet({ scheduleId, userId, role }) {
     [scheduleId],
   );
   if (!schedule.rows[0]) throw notFound('Paper not found.');
+  const paper = schedule.rows[0];
+
+  // Scope and roster both follow the EXAM's year, never "whatever year it is now".
+  if (role !== 'admin') await assertTeacherPaper(userId, scheduleId, paper.academic_year_id);
 
   const roster = await query(
     `SELECT st.id AS student_id, st.admission_id, st.first_name || ' ' || st.last_name AS name,
             m.id AS mark_id, m.marks_obtained, m.is_absent, m.status, m.remarks,
             g.code AS grade
        FROM enrollments e
-       JOIN students st ON st.id = e.student_id AND st.deleted_at IS NULL
+       JOIN students st ON st.id = e.student_id
        LEFT JOIN marks m ON m.exam_schedule_id = $1 AND m.student_id = st.id
        LEFT JOIN grades g ON g.id = m.grade_id
       WHERE e.class_id = $2 AND e.academic_year_id = $3 AND e.status = 'active'
+        AND st.deleted_at IS NULL
+        AND st.status NOT IN ('withdrawn', 'transferred', 'graduated')
       ORDER BY st.admission_id`,
-    [scheduleId, schedule.rows[0].class_id, yearId],
+    [scheduleId, paper.class_id, paper.academic_year_id],
   );
 
   const editable =
     role === 'admin'
-      ? schedule.rows[0].publish_status !== 'published'
-      : schedule.rows[0].publish_status !== 'published' &&
-        roster.rows.every((row) => row.status !== 'submitted');
+      ? paper.publish_status !== 'published'
+      : paper.publish_status !== 'published' && roster.rows.every((row) => row.status !== 'submitted');
 
-  return { ...schedule.rows[0], students: roster.rows, editable };
+  return { ...paper, students: roster.rows, editable };
 }
 
 export async function saveMarks({ scheduleId, userId, role, entries, submit, ip, userAgent }) {
-  const year = await currentYear();
-  const yearId = year?.id ?? 0;
-  if (role !== 'admin') await assertTeacherPaper(userId, scheduleId, yearId);
-
-  const schedule = await query(
-    `SELECT s.id, s.max_marks, s.class_id, s.exam_id, ex.publish_status
-       FROM exam_schedules s JOIN examinations ex ON ex.id = s.exam_id WHERE s.id = $1`,
-    [scheduleId],
-  );
-  if (!schedule.rows[0]) throw notFound('Paper not found.');
-  if (schedule.rows[0].publish_status === 'published') {
-    throw conflict('Results are published; an admin must unlock this paper first.', 'MARKS_LOCKED');
-  }
-  const maxMarks = Number(schedule.rows[0].max_marks);
-
-  const submitted = await query(
-    "SELECT count(*)::int AS total FROM marks WHERE exam_schedule_id = $1 AND status = 'submitted'",
-    [scheduleId],
-  );
-  if (submitted.rows[0].total > 0 && role !== 'admin') {
-    throw conflict('These marks are submitted. Ask the admin to unlock them.', 'MARKS_SUBMITTED');
-  }
-
+  // Value checks need no database round-trip; do them first.
   for (const entry of entries) {
-    if (!entry.isAbsent) {
-      if (entry.marksObtained === null || entry.marksObtained === undefined) {
-        throw conflict('Every student needs marks or an absent mark.', 'MARKS_MISSING');
-      }
+    if (entry.isAbsent) continue;
+    if (entry.marksObtained === null || entry.marksObtained === undefined) {
+      throw conflict('Every student needs marks or an absent mark.', 'MARKS_MISSING');
+    }
+    if (!Number.isFinite(Number(entry.marksObtained))) {
+      throw conflict('Marks must be a number.', 'MARKS_INVALID');
+    }
+  }
+
+  const grades = await gradeTable();
+
+  const saved = await withTransaction(async (client) => {
+    const schedule = await client.query(
+      `SELECT s.id, s.max_marks, s.class_id, s.exam_id, ex.academic_year_id, ex.publish_status
+         FROM exam_schedules s
+         JOIN examinations ex ON ex.id = s.exam_id
+        WHERE s.id = $1 FOR UPDATE`,
+      [scheduleId],
+    );
+    if (!schedule.rows[0]) throw notFound('Paper not found.');
+    const paper = schedule.rows[0];
+    if (paper.publish_status === 'published') {
+      throw conflict('Results are published; an admin must unlock this paper first.', 'MARKS_LOCKED');
+    }
+    if (role !== 'admin') await assertTeacherPaper(userId, scheduleId, paper.academic_year_id, client);
+
+    const maxMarks = Number(paper.max_marks);
+    for (const entry of entries) {
+      if (entry.isAbsent) continue;
       if (Number(entry.marksObtained) < 0 || Number(entry.marksObtained) > maxMarks) {
         throw conflict(`Marks must be between 0 and ${maxMarks}.`, 'MARKS_OUT_OF_RANGE');
       }
     }
-  }
 
-  const enrolled = await query(
-    `SELECT student_id FROM enrollments WHERE class_id = $1 AND academic_year_id = $2 AND status = 'active'`,
-    [schedule.rows[0].class_id, yearId],
-  );
-  const allowed = new Set(enrolled.rows.map((row) => row.student_id));
-  for (const entry of entries) {
-    if (!allowed.has(entry.studentId)) {
-      throw forbidden('One of the students is not in this class.', 'STUDENT_NOT_IN_CLASS');
+    // Read the submitted state inside the lock, otherwise a submit that lands between the check
+    // and the write is silently turned back into drafts.
+    const submitted = await client.query(
+      "SELECT count(*)::int AS total FROM marks WHERE exam_schedule_id = $1 AND status = 'submitted'",
+      [scheduleId],
+    );
+    if (submitted.rows[0].total > 0 && role !== 'admin') {
+      throw conflict('These marks are submitted. Ask the admin to unlock them.', 'MARKS_SUBMITTED');
     }
-  }
 
-  if (submit) {
-    const covered = new Set(entries.map((entry) => entry.studentId));
-    const missing = [...allowed].filter((id) => !covered.has(id));
-    if (missing.length > 0) {
-      throw conflict(
-        `${missing.length} student(s) still have no marks. Enter every student before submitting.`,
-        'MARKS_INCOMPLETE',
-      );
+    const roster = await client.query(
+      `SELECT st.id AS student_id
+         FROM enrollments e
+         JOIN students st ON st.id = e.student_id
+        WHERE e.class_id = $1 AND e.academic_year_id = $2 AND e.status = 'active'
+          AND st.deleted_at IS NULL
+          AND st.status NOT IN ('withdrawn', 'transferred', 'graduated')`,
+      [paper.class_id, paper.academic_year_id],
+    );
+    const allowed = new Set(roster.rows.map((row) => row.student_id));
+    for (const entry of entries) {
+      if (!allowed.has(entry.studentId)) {
+        throw forbidden('One of the students is not in this class.', 'STUDENT_NOT_IN_CLASS');
+      }
     }
-  }
 
-  const saved = await withTransaction(async (client) => {
+    if (submit) {
+      const covered = new Set(entries.map((entry) => entry.studentId));
+      const missing = [...allowed].filter((id) => !covered.has(id));
+      if (missing.length > 0) {
+        throw conflict(
+          `${missing.length} student(s) still have no marks. Enter every student before submitting.`,
+          'MARKS_INCOMPLETE',
+        );
+      }
+    }
+
     const results = [];
     for (const entry of entries) {
       const percentage = entry.isAbsent || entry.marksObtained === null
         ? null
         : (Number(entry.marksObtained) / maxMarks) * 100;
-      const grade = percentage === null ? null : await gradeFor(percentage, client);
+      const grade = percentage === null ? null : gradeFrom(grades, percentage);
       const { rows } = await client.query(
         `INSERT INTO marks (exam_schedule_id, student_id, marks_obtained, is_absent, grade_id,
            status, remarks, entered_by, submitted_at)
@@ -494,7 +561,7 @@ export async function reportCard({ studentId, examId }) {
             m.marks_obtained, m.is_absent, g.code AS grade, m.status
        FROM exam_schedules s
        JOIN subjects sub ON sub.id = s.subject_id
-       LEFT JOIN marks m ON m.exam_schedule_id = s.id AND m.student_id = $1
+       LEFT JOIN marks m ON m.exam_schedule_id = s.id AND m.student_id = $1 AND m.status = 'submitted'
        LEFT JOIN grades g ON g.id = m.grade_id
       WHERE s.exam_id = $2 AND s.class_id = $3
       ORDER BY sub.name`,
@@ -531,28 +598,58 @@ export async function reportCard({ studentId, examId }) {
   };
 }
 
-export async function classResults({ examId, classId }) {
+export async function classResults({ examId, classId, user }) {
+  const exam = await query(
+    'SELECT id, academic_year_id FROM examinations WHERE id = $1 AND deleted_at IS NULL',
+    [examId],
+  );
+  if (!exam.rows[0]) throw notFound('Exam not found.');
+  const examYear = exam.rows[0].academic_year_id;
+
+  // Permission is not scope: a teacher may hold result.view.assigned and still not teach this class.
+  if (user?.role !== 'admin') {
+    const teaches = await query(
+      `SELECT 1 FROM teacher_subjects ts
+         JOIN teachers t ON t.id = ts.teacher_id
+        WHERE t.user_id = $1 AND ts.class_id = $2 AND ts.academic_year_id = $3
+        LIMIT 1`,
+      [user?.id, classId, examYear],
+    );
+    if (!teaches.rows[0]) {
+      throw forbidden('You can only see the results of classes you teach this year.', 'RESULT_FORBIDDEN');
+    }
+  }
+
   const { rows } = await query(
     `SELECT st.id AS student_id, st.admission_id, st.first_name || ' ' || st.last_name AS name,
-            count(m.id)::int AS papers,
-            coalesce(sum(m.marks_obtained), 0)::numeric AS obtained,
-            coalesce(sum(s.max_marks), 0)::numeric AS maximum
+            count(DISTINCT s.id) FILTER (WHERE m.status = 'submitted')::int AS papers,
+            coalesce(sum(m.marks_obtained) FILTER (WHERE m.status = 'submitted'), 0)::numeric AS obtained,
+            coalesce(sum(s.max_marks) FILTER (WHERE m.status = 'submitted'), 0)::numeric AS maximum
        FROM enrollments e
-       JOIN students st ON st.id = e.student_id AND st.deleted_at IS NULL
+       JOIN students st ON st.id = e.student_id
        LEFT JOIN exam_schedules s ON s.exam_id = $1 AND s.class_id = e.class_id
        LEFT JOIN marks m ON m.exam_schedule_id = s.id AND m.student_id = st.id
-      WHERE e.class_id = $2 AND e.status = 'active'
+      WHERE e.class_id = $2 AND e.academic_year_id = $3 AND e.status = 'active'
+        AND st.deleted_at IS NULL
+        AND st.status NOT IN ('withdrawn', 'transferred', 'graduated')
       GROUP BY st.id, st.admission_id, st.first_name, st.last_name
       ORDER BY obtained DESC, st.admission_id`,
-    [examId, classId],
+    [examId, classId, examYear],
   );
 
+  // Standard competition ranking: equal totals share a rank (1, 1, 3), not 1, 2, 3.
+  let position = 0;
+  let previous = null;
   return rows.map((row, index) => {
     const obtained = Number(row.obtained);
     const maximum = Number(row.maximum);
+    if (previous === null || obtained !== previous) {
+      position = index + 1;
+      previous = obtained;
+    }
     const percentage = maximum > 0 ? Math.round((obtained / maximum) * 1000) / 10 : 0;
     return {
-      position: index + 1,
+      position,
       studentId: row.student_id,
       admissionId: row.admission_id,
       name: row.name,

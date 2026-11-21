@@ -9,12 +9,11 @@ import { AppError } from './utils/errors.js';
 import apiRoutes from './routes/index.js';
 
 /**
- * Every host this deployment can legitimately be opened from: any `vvs-*.vercel.app`
- * (production alias, short alias, per-deployment preview) and localhost/127.0.0.1 on any port.
- * Kept narrow on purpose — a bare `*.vercel.app` would let anyone's Vercel site call the API
- * with the visitor's cookies.
+ * CORS is an allow-list, never a wildcard family. A `vvs-*.vercel.app` pattern looks narrow but
+ * anyone can register `vvs-evil.vercel.app` on a free Vercel account, and `/auth/refresh` hands a
+ * valid access token back in the response body — so a pattern is account takeover with one click.
+ * Only the origins named in CLIENT_ORIGIN are accepted, plus localhost when this is not production.
  */
-const PROJECT_ORIGIN = /^https:\/\/vvs-[a-z0-9-]+\.vercel\.app$/;
 const LOCAL_ORIGIN = /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
 
 export function createApp() {
@@ -40,7 +39,7 @@ export function createApp() {
           .filter(Boolean);
         if (!origin) return callback(null, true);
         if (allowed.includes(origin)) return callback(null, true);
-        if (PROJECT_ORIGIN.test(origin) || LOCAL_ORIGIN.test(origin)) return callback(null, true);
+        if (!config.isProduction && LOCAL_ORIGIN.test(origin)) return callback(null, true);
         console.warn('[api] blocked CORS origin:', origin);
         return callback(null, false);
       },
@@ -71,14 +70,10 @@ export function createApp() {
    * generic 404 envelope — that 404 is what reads as "backend connect nahi hua".
    * Deliberately not the app envelope: this shape is the one people paste into a status check.
    */
-  app.get(['/', '/api'], async (_req, res) => {
-    try {
-      await healthCheck();
-      res.json({ ok: true, service: config.statusService, status: 'running' });
-    } catch (error) {
-      console.error('[api] status probe failed', error.code || error.message);
-      res.status(503).json({ ok: false, service: config.statusService, status: 'database unreachable' });
-    }
+  app.get(['/', '/api'], (_req, res) => {
+    // No database round-trip here on purpose: this path is hit by uptime monitors and strangers,
+    // and `/api/health` is the one endpoint that proves the pool really works.
+    res.json({ ok: true, service: config.statusService, status: 'running' });
   });
 
   app.use('/api', apiRoutes);

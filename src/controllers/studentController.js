@@ -52,6 +52,27 @@ async function assertCanView(req, studentId) {
     );
     if (linked.rows[0]) return;
   }
+  // A teacher holds student.view.assigned and can list the roster; opening one of those students
+  // used to answer 403. Scope it in SQL: the student must be in a class/section they teach this year.
+  if (role === 'teacher') {
+    const teaches = await query(
+      `SELECT 1
+         FROM enrollments e
+         JOIN academic_years ay ON ay.id = e.academic_year_id AND ay.is_current AND ay.deleted_at IS NULL
+        WHERE e.student_id = $1 AND e.status = 'active'
+          AND (
+            EXISTS (SELECT 1 FROM class_teachers ct
+                     WHERE ct.academic_year_id = e.academic_year_id
+                       AND ct.section_id = e.section_id AND ct.teacher_id = (SELECT id FROM teachers WHERE user_id = $2 AND deleted_at IS NULL))
+            OR EXISTS (SELECT 1 FROM teacher_subjects ts
+                        WHERE ts.academic_year_id = e.academic_year_id
+                          AND ts.class_id = e.class_id AND ts.teacher_id = (SELECT id FROM teachers WHERE user_id = $2 AND deleted_at IS NULL))
+          )
+        LIMIT 1`,
+      [studentId, userId],
+    );
+    if (teaches.rows[0]) return;
+  }
   throw forbidden('You can only view your own records.', 'STUDENT_FORBIDDEN');
 }
 

@@ -177,8 +177,10 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
     throw conflict('The section does not belong to the selected class.', 'SECTION_CLASS_MISMATCH');
   }
 
-  const sharedPassword = temporaryPassword();
-  const sharedHash = await bcrypt.hash(sharedPassword, config.auth.bcryptRounds);
+  // One temporary password PER ACCOUNT. A shared one means a parent can sign in as the child (whose
+  // username is the sequential admission id) or as another guardian.
+  const studentPassword = temporaryPassword();
+  const studentHash = await bcrypt.hash(studentPassword, config.auth.bcryptRounds);
 
   // Duplicate guard: the same child admitted twice (double click, or a re-typed form).
   // The database enforces this too (students_identity_unique); this check exists so the
@@ -216,6 +218,7 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
   // Guardian logins created by this admission (an already-existing family account keeps its
   // old password, so it must not be advertised with the new shared one).
   const guardianLogins = [];
+  const guardianWarnings = [];
   try {
     const result = await withTransaction(async (client) => {
       // 1. Student row — admission_id comes from the database sequence, never the client.
@@ -244,10 +247,10 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
           `INSERT INTO users (role_id, username, email, password_hash, must_change_password)
            VALUES ((SELECT id FROM roles WHERE code = 'student'), $1, NULL, $2, TRUE)
            RETURNING id`,
-          [admissionId, sharedHash],
+          [admissionId, studentHash],
         );
         await client.query('UPDATE students SET user_id = $2 WHERE id = $1', [studentId, user.rows[0].id]);
-        login = { username: admissionId, temporaryPassword: sharedPassword };
+        login = { username: admissionId, temporaryPassword: studentPassword };
       }
 
       // 3. Enrollment for the academic year.
@@ -259,22 +262,47 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
 
       // 4. Guardians — one family account is reused when the mobile or email matches.
       for (const parent of payload.parents || []) {
+        // Match on contact AND name. Matching on the mobile alone linked a child to a stranger
+        // whenever the number was typed wrong (or reused), and that stranger could then read the
+        // child's results, fees and ID card.
         const existing = await client.query(
           `SELECT id, user_id FROM parents
-            WHERE deleted_at IS NULL AND (lower(email) = lower($1) OR mobile = $2)
+            WHERE deleted_at IS NULL
+              AND lower(btrim(full_name)) = lower(btrim($3))
+              AND (mobile = $2 OR lower(coalesce(email, '')) = lower($1))
             LIMIT 1`,
-          [parent.email ?? '', parent.mobile],
+          [parent.email ?? '', parent.mobile, parent.fullName],
         );
+
+        if (!existing.rows[0]) {
+          // Same number, different person: do not link, but tell the office so they can confirm.
+          const sameNumber = await client.query(
+            `SELECT full_name FROM parents
+              WHERE deleted_at IS NULL AND mobile = $1
+                AND lower(btrim(full_name)) <> lower(btrim($2))
+              LIMIT 1`,
+            [parent.mobile, parent.fullName],
+          );
+          if (sameNumber.rows[0]) {
+            guardianWarnings.push({
+              guardian: parent.fullName,
+              mobile: parent.mobile,
+              message: `This mobile is already used by ${sameNumber.rows[0].full_name}. A new guardian record was created — confirm the number before sharing login details.`,
+            });
+          }
+        }
 
         let parentId;
         if (existing.rows[0]) {
           parentId = existing.rows[0].id;
           if (!existing.rows[0].user_id) {
+            const guardianPassword = temporaryPassword();
+            const guardianHash = await bcrypt.hash(guardianPassword, config.auth.bcryptRounds);
             const user = await client.query(
               `INSERT INTO users (role_id, username, email, password_hash, must_change_password)
                VALUES ((SELECT id FROM roles WHERE code = 'parent'), $1, $2, $3, TRUE)
                RETURNING id`,
-              [parent.email || parent.mobile, parent.email ?? null, sharedHash],
+              [parent.email || parent.mobile, parent.email ?? null, guardianHash],
             );
             await client.query('UPDATE parents SET user_id = $2 WHERE id = $1', [
               parentId,
@@ -283,6 +311,7 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
             guardianLogins.push({
               name: parent.fullName,
               username: parent.email || parent.mobile,
+              temporaryPassword: guardianPassword,
             });
           }
         } else {
@@ -301,16 +330,19 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
             ],
           );
           parentId = created.rows[0].id;
+          const guardianPassword = temporaryPassword();
+          const guardianHash = await bcrypt.hash(guardianPassword, config.auth.bcryptRounds);
           const user = await client.query(
             `INSERT INTO users (role_id, username, email, password_hash, must_change_password)
              VALUES ((SELECT id FROM roles WHERE code = 'parent'), $1, $2, $3, TRUE)
              RETURNING id`,
-            [parent.email || parent.mobile, parent.email ?? null, sharedHash],
+            [parent.email || parent.mobile, parent.email ?? null, guardianHash],
           );
           await client.query('UPDATE parents SET user_id = $2 WHERE id = $1', [parentId, user.rows[0].id]);
           guardianLogins.push({
             name: parent.fullName,
             username: parent.email || parent.mobile,
+            temporaryPassword: guardianPassword,
           });
         }
 
@@ -376,6 +408,7 @@ export async function createStudent({ payload, files = [], documentTypes = [], a
       student: await getStudent(result.studentId),
       account: result.login,
       guardians: guardianLogins,
+      warnings: guardianWarnings,
     };
   } catch (error) {
     await removeUploads(writtenFiles);
@@ -586,10 +619,17 @@ export async function changeStatus(studentId, { status, effectiveDate, remarks }
       [studentId, year?.id ?? null, current.rows[0].status, status, effectiveDate, remarks ?? null, actor?.id ?? null],
     );
 
-    // A student who leaves must not keep a working login.
+    // A student who leaves must not keep a working login — and one who comes back must get it again
+    // (this used to be one-way: withdrawn -> active left the account disabled for ever).
     if (['transferred', 'withdrawn', 'graduated', 'suspended'].includes(status)) {
       await client.query(
         `UPDATE users SET is_active = FALSE, deactivated_at = now()
+          WHERE id = (SELECT user_id FROM students WHERE id = $1)`,
+        [studentId],
+      );
+    } else if (status === 'active') {
+      await client.query(
+        `UPDATE users SET is_active = TRUE, deactivated_at = NULL
           WHERE id = (SELECT user_id FROM students WHERE id = $1)`,
         [studentId],
       );

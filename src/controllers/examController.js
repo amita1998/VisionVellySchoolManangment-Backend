@@ -183,5 +183,5 @@ export const publishedExams = asyncHandler(async (req, res) => {
 export const classResults = asyncHandler(async (req, res) => {
   const examId = Number(req.params.examId);
   const classId = Number(req.params.classId);
-  res.json({ success: true, data: { results: await exams.classResults({ examId, classId }) } });
+  res.json({ success: true, data: { results: await exams.classResults({ examId, classId, user: req.user }) } });
 });
